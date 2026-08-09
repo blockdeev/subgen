@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "subgen-worker"
+version = "1.0.0"
+description = "SubGen - Celery worker (pipeline de subtitulado)"
+requires-python = ">=3.11"
+dependencies = [
+    "celery[redis]>=5.3,<6",
+    "redis>=5.0,<6",
+    "faster-whisper>=1.0",
+    "deep-translator>=1.11",
+    "yt-dlp>=2024.1",
+    "boto3>=1.34",
+    "pydantic>=2.5,<3",
+    "pydantic-settings>=2.1,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "mypy>=1.7",
+    "types-redis",
+    "boto3-stubs[s3]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+exclude = ["tests"]
+
+[tool.pytest.ini_options]
+# Se corren explícitamente por archivo (ver README, "cómo correr los
+# tests"): mezclar test_api.py con auto-discovery en este venv rompe su
+# import, porque acá `app` es el paquete del worker, no el de la API.
+addopts = "--cov=app --cov-report=term-missing"

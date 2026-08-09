@@ -1,0 +1,108 @@
+# SubGen — despliegue distribuido en 4 VPS de Hetzner.
+#
+# Docker Compose no orquesta multi-host por sí solo (por eso el enunciado
+# pide explícitamente NO usar Kubernetes/Swarm): la forma de "desplegar
+# distribuido" con compose solo es copiar ESTE MISMO archivo a las 4 VPS y,
+# en cada una, levantar ÚNICAMENTE el servicio que le corresponde:
+#
+#   VPS 1:  docker compose -f docker-compose.prod.yml up -d api
+#   VPS 2:  docker compose -f docker-compose.prod.yml up -d redis
+#   VPS 3:  docker compose -f docker-compose.prod.yml up -d worker-1
+#   VPS 4:  docker compose -f docker-compose.prod.yml up -d worker-2
+#
+# Cada VPS necesita su propio `.env` (ver README, guía de despliegue) con
+# SUBGEN_REDIS_URL / SUBGEN_S3_* apuntando a la IP de red privada de la
+# VPS 2 (redis) y al bucket S3-compatible que elijas.
+#
+# `minio` es OPCIONAL y está detrás de un profile: solo se levanta si en
+# vez de Hetzner Object Storage / AWS S3 elegís hostear tu propio MinIO
+# (ver README, alternativa de almacenamiento). Si lo usás, es razonable
+# correrlo en la misma VPS 2 (junto a Redis) para no pedir una quinta VPS.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Bindear al puerto de la red PRIVADA, nunca 0.0.0.0 en producción.
+    ports:
+      - "${PRIVATE_IP:-0.0.0.0}:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    profiles: ["selfhosted-storage"]
+    command: server /data --console-address ":9001"
+    env_file: .env
+    ports:
+      - "${PRIVATE_IP:-0.0.0.0}:9000:9000"
+      - "${PRIVATE_IP:-0.0.0.0}:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: subgen-api:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:8000"   # o 443 detrás de un reverse proxy con TLS, ver README
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker-1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    image: subgen-worker:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ${YTDLP_COOKIES_FILE_HOST:-/dev/null}:/worker/cookies.txt:ro
+      - whisper-cache:/home/subgen/.cache/huggingface
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1", "-B"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.celery_app import celery_app; celery_app.control.ping(timeout=5) or exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    image: subgen-worker:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ${YTDLP_COOKIES_FILE_HOST:-/dev/null}:/worker/cookies.txt:ro
+      - whisper-cache:/home/subgen/.cache/huggingface
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.celery_app import celery_app; celery_app.control.ping(timeout=5) or exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  redis-data:
+  minio-data:
+  whisper-cache:

@@ -1,0 +1,45 @@
+# Entornos virtuales
+.venv/
+.venv-*/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tests / type-checking
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Variables de entorno (NUNCA commitear el .env real con credenciales)
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Node (por si algo del frontend en algún momento usa tooling)
+node_modules/
+
+# Volúmenes/datos locales si alguna vez se montan como carpetas
+downloads/
+subtitles/
+videos/
+
+# Cookies de YouTube exportadas para yt-dlp — son credenciales de sesión,
+# NUNCA se commitean, y tampoco hace falta que viajen en el build context.
+cookies.txt
+*.cookies.txt

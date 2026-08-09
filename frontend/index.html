@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SubGen — Subtítulos en Español</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/styles.css">
+<script>
+  // Anti-flash: aplica el tema ANTES del primer render. Tiene que ser
+  // inline (no un <script src>) para que no haya ni un round-trip de red
+  // entre "se pinta el body" y "se aplica el tema correcto".
+  (function () {
+    try {
+      var stored = localStorage.getItem('subgen:theme');
+      var theme = stored || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.dataset.theme = theme;
+    } catch (e) {
+      document.documentElement.dataset.theme = 'dark';
+    }
+  })();
+</script>
+</head>
+<body>
+
+<div class="bg-glow bg-glow-1"></div>
+<div class="bg-glow bg-glow-2"></div>
+
+<div class="container">
+  <header>
+    <div class="header-controls">
+      <button class="icon-btn" id="themeToggleBtn" type="button" aria-label="Cambiar tema">
+        <span class="icon-btn-glyph">🌙</span><span class="icon-btn-label">Claro</span>
+      </button>
+      <button class="icon-btn" id="langToggleBtn" type="button" aria-label="Change interface language">EN</button>
+    </div>
+    <div class="logo">
+      <div class="logo-icon">🎬</div>
+      <span class="logo-text">SubGen</span>
+    </div>
+    <p data-i18n="header.tagline">Pegá la URL de un video en inglés y elegí qué querés obtener.</p>
+  </header>
+
+  <div class="card">
+    <div class="card-title" data-i18n="card.urlTitle">URL del video</div>
+    <div class="input-group">
+      <input type="text" id="urlInput" data-i18n-placeholder="url.placeholder"
+             placeholder="https://www.youtube.com/watch?v=..." autofocus>
+    </div>
+
+    <div class="lang-row">
+      <span class="lang-label" data-i18n="translate.label">Traducir a:</span>
+      <select id="langSelect" class="lang-select">
+        <option value="es">Español</option>
+        <option value="pt">Português</option>
+        <option value="fr">Français</option>
+        <option value="de">Deutsch</option>
+        <option value="it">Italiano</option>
+        <option value="ja">日本語</option>
+        <option value="ko">한국어</option>
+        <option value="zh-CN">中文</option>
+      </select>
+    </div>
+    <span class="lang-row-hint" data-i18n="translate.hint">
+      Esto traduce los SUBTÍTULOS. El idioma de esta página se cambia con el botón "EN" de arriba.
+    </span>
+
+    <div class="action-row" id="actionRow">
+      <button class="action-btn action-btn-srt" data-mode="srt">
+        <span class="action-icon">📄</span>
+        <span class="action-label" data-i18n="actions.srt.label">Solo subtítulos</span>
+        <span class="action-desc" data-i18n="actions.srt.desc" style="white-space: pre-line;">Genera el archivo .SRT
+Más rápido</span>
+      </button>
+      <button class="action-btn action-btn-video" data-mode="video">
+        <span class="action-icon">🎬</span>
+        <span class="action-label" data-i18n="actions.video.label">Video con subtítulos</span>
+        <span class="action-desc" data-i18n="actions.video.desc" style="white-space: pre-line;">Video .MP4 con subs quemados
+Listo para compartir</span>
+      </button>
+    </div>
+
+    <div class="error-msg" id="errorMsg"></div>
+
+    <div class="progress-area" id="progressArea">
+      <div id="pipelineContainer"></div>
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-status">
+        <span class="progress-message pulsing" id="progressMsg" data-i18n="status.queued">En cola...</span>
+        <span class="progress-percent" id="progressPct">0%</span>
+      </div>
+      <span class="progress-eta" id="progressEta"></span>
+    </div>
+  </div>
+
+  <div class="card result-area" id="resultArea">
+    <div class="result-header">
+      <div class="result-check">✓</div>
+      <div>
+        <div class="result-title" id="resultTitle"></div>
+        <div class="result-meta" id="resultMeta"></div>
+      </div>
+    </div>
+    <div id="downloadRow"></div>
+    <div class="card-title" style="margin-top: 16px;" data-i18n="preview.title">Vista previa</div>
+    <div class="preview-box" id="previewBox"></div>
+  </div>
+
+  <div class="footer-note" id="footerNote" data-i18n="footer.text" data-i18n-html>
+    SubGen usa <a href="https://github.com/SYSTRAN/faster-whisper" target="_blank">Faster-Whisper</a>
+    para transcripción y Google Translate para traducción.<br>
+    Soporta YouTube, Vimeo, Twitter/X, y
+    <a href="https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md" target="_blank">cientos más</a>.
+  </div>
+</div>
+
+<script src="js/i18n.js"></script>
+<script src="js/theme.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

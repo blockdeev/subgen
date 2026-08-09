@@ -1,0 +1,105 @@
+# SubGen — local / demo rápida. `docker compose up --build`
+# Levanta los mismos 4 servicios lógicos de la arquitectura (api, redis,
+# worker-1, worker-2) más MinIO como stand-in local del almacenamiento
+# S3-compatible (ver README, "Almacenamiento").
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    env_file: .env
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # consola web
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - minio-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker-1:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    # Cookies de YouTube (opcionales): ver README, "Cookies de YouTube".
+    # Si YTDLP_COOKIES_FILE_HOST no está seteado en .env, se monta /dev/null
+    # (archivo vacío) y yt-dlp simplemente no usa cookies, igual que antes.
+    volumes:
+      - ${YTDLP_COOKIES_FILE_HOST:-/dev/null}:/worker/cookies.txt:ro
+      - whisper-cache:/home/subgen/.cache/huggingface
+    # worker-1 embebe Celery Beat (-B): la tarea periódica de limpieza
+    # corre acá y solo acá, para no duplicarse entre workers.
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1", "-B"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.celery_app import celery_app; celery_app.control.ping(timeout=5) or exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  worker-2:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ${YTDLP_COOKIES_FILE_HOST:-/dev/null}:/worker/cookies.txt:ro
+      - whisper-cache:/home/subgen/.cache/huggingface
+    command: ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.celery_app import celery_app; celery_app.control.ping(timeout=5) or exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  redis-data:
+  minio-data:
+  whisper-cache:
