@@ -142,6 +142,18 @@ def _parse_progress_stream(
             on_progress(event)
 
 
+def _drain_stderr(process: "subprocess.Popen[str]", chunks: list[str]) -> None:
+    """Thread separado para stderr, igual que el de stdout. Antes esto lo
+    manejaba `process.communicate()` a la vez que un thread aparte ya leía
+    stdout de forma independiente — dos consumidores sobre el mismo pipe al
+    mismo tiempo, comportamiento indefinido y con riesgo real de colgarse
+    (bug encontrado en producción con videos largos). Ahora cada pipe tiene
+    su propio thread dedicado, sin pisarse."""
+    assert process.stderr is not None
+    for line in iter(process.stderr.readline, ""):
+        chunks.append(line)
+
+
 def _run_ffmpeg_with_progress(
     cmd: list[str],
     total_seconds: float,
@@ -153,22 +165,37 @@ def _run_ffmpeg_with_progress(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
     )
 
-    reader = threading.Thread(
+    stdout_reader = threading.Thread(
         target=_parse_progress_stream, args=(process, total_seconds, on_progress, started_at),
         daemon=True,
     )
-    reader.start()
+    stdout_reader.start()
+
+    stderr_chunks: list[str] = []
+    stderr_reader = threading.Thread(target=_drain_stderr, args=(process, stderr_chunks), daemon=True)
+    stderr_reader.start()
 
     try:
-        _, stderr = process.communicate(timeout=timeout_seconds)
+        returncode = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.communicate()
+        process.wait()
         raise BurnError(f"FFmpeg superó el timeout de {timeout_seconds}s")
     finally:
-        reader.join(timeout=5)
+        # Si algo interrumpe esta función por CUALQUIER otro motivo (el
+        # ejemplo real: Celery corta la tarea por soft_time_limit, que es
+        # MENOR a este timeout propio, así que en la práctica siempre
+        # dispara primero) — sin esto, el proceso de FFmpeg queda corriendo
+        # huérfano en el contenedor, consumiendo CPU indefinidamente aunque
+        # la tarea ya haya terminado del lado de Celery.
+        if process.poll() is None:
+            logger.warning("FFmpeg seguía vivo al salir de _run_ffmpeg_with_progress, matándolo")
+            process.kill()
+            process.wait()
+        stdout_reader.join(timeout=5)
+        stderr_reader.join(timeout=5)
 
-    return process.returncode, stderr or ""
+    return returncode, "".join(stderr_chunks)
 
 
 def burn_subs(

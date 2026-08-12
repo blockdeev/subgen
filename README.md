@@ -429,6 +429,23 @@ pero esta disenado para no pelear con una migracion a k8s mas adelante:
 - **Limite de duracion**: video que supera `MAX_VIDEO_DURATION_SECONDS` se
   rechaza antes de gastar computo en transcribirlo.
 
+### Nota operativa: visibility_timeout de Redis (recuperación tras un crash)
+
+Verificado en producción: si un worker muere a mitad de una tarea (crash,
+`docker compose down` sin querer, restart del host), Celery con
+`acks_late=True` debería devolver esa tarea a la cola para que otro worker
+la retome. Pero Redis como broker tiene su propio `visibility_timeout`
+(default de kombu: 3600s) — hasta que no pase ese tiempo, considera que el
+mensaje "probablemente sigue siendo procesado" y no lo redistribuye. Sin
+configurarlo explícitamente, un crash real puede dejar un job mostrando su
+último progreso conocido durante **hasta una hora**, sin que nadie lo esté
+procesando de verdad.
+
+Está configurado en `celery_app.py` como `task_time_limit + 300` (justo
+por encima del tiempo máximo que puede durar una tarea legítima, para no
+redistribuir un job que todavía está corriendo bien). Si cambiás
+`SUBGEN_CELERY_TASK_TIME_LIMIT`, este valor se ajusta solo.
+
 ### Nota operativa: primer job lento (carga del modelo Whisper)
 
 Verificado en vivo: el primer job que procesa CADA proceso worker paga dos

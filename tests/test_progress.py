@@ -129,3 +129,39 @@ class TestAggregatePct:
     def test_clamps_out_of_range_stage_pct(self):
         assert _aggregate_pct("downloading", -10, "video") == pytest.approx(0.0)
         assert _aggregate_pct("downloading", 150, "video") == pytest.approx(20.0)
+
+
+class TestMakeOnProgress:
+    """Bug real de producción: sin `task_id` explícito, `update_state()`
+    depende de `self.request.id`, que Celery guarda en contexto POR THREAD.
+    El callback de progreso del quemado se invoca desde el thread aparte
+    que lee el progreso de FFmpeg (no el thread principal de la tarea) —
+    ahí `self.request.id` puede resolver a `None`, y `update_state()`
+    explota adentro del propio Celery con
+    "task_id must not be empty. Got None instead." en cada actualización
+    de progreso durante el quemado.
+    """
+
+    def test_update_state_receives_explicit_task_id(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from app import tasks as tasks_module
+        from app.pipeline.progress_types import StageProgress
+        from app.tasks import _make_on_progress
+
+        monkeypatch.setattr(tasks_module, "_publisher", MagicMock())
+
+        fake_task = MagicMock()
+        # Simula justo el escenario del bug: el contexto de Celery no está
+        # disponible (como pasaría desde un thread aparte).
+        fake_task.request.id = None
+
+        on_progress = _make_on_progress(fake_task, "job123", "video")
+        on_progress(StageProgress(stage="burning", stage_pct=50.0, message_key="status.burning_progress"))
+
+        fake_task.update_state.assert_called_once()
+        _, kwargs = fake_task.update_state.call_args
+        assert kwargs.get("task_id") == "job123", (
+            "update_state() tiene que recibir task_id explícito -- si no, depende de "
+            "self.request.id, que puede ser None si se llama desde otro thread"
+        )

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from celery import Task
 from celery.exceptions import SoftTimeLimitExceeded
@@ -69,10 +71,33 @@ def _make_on_progress(task: Task, job_id: str, mode: str) -> ProgressCallback:
             "message_params": event.message_params,
             "eta_seconds": round(event.eta_seconds) if event.eta_seconds is not None else None,
         }
-        task.update_state(state="PROGRESS", meta=payload)
+        # OJO: task_id EXPLÍCITO, no confiar en self.request.id. Durante el
+        # quemado, este callback se llama desde un thread aparte (el que
+        # lee el progreso de FFmpeg) — el contexto de Celery (self.request)
+        # vive en almacenamiento por thread, así que desde otro thread
+        # `self.request.id` puede resolver a None. Eso hacía explotar
+        # `update_state()` adentro del propio Celery con
+        # "task_id must not be empty" en CADA actualización de progreso
+        # del quemado — potencialmente cientos de excepciones no
+        # manejadas por job, sospechoso de haber contribuido al freeze
+        # real de sistema operativo que se vio en producción.
+        task.update_state(task_id=job_id, state="PROGRESS", meta=payload)
         _publisher.publish(job_id, payload)
 
     return on_progress
+
+
+@contextmanager
+def _stage_timer(job_id: str, stage: str) -> Iterator[None]:
+    """Loguea cuánto tardó cada etapa, en éxito o en error — pedido
+    explícito para poder medir tiempos reales por etapa en vez de asumir
+    dónde está el costo. `finally` para que quede logueado incluso si la
+    etapa falla o hace timeout a mitad de camino."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        logger.info("Job %s: etapa '%s' tomó %.1fs", job_id, stage, time.monotonic() - t0)
 
 
 def _publish_terminal(job_id: str, status: str, **extra: Any) -> None:
@@ -100,17 +125,18 @@ def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str
     try:
         video_path: Path | None = None
 
-        if mode == "video":
-            dl_result, audio_path = download_video_full(
-                url, job_id, work_dir, on_progress, cookies_file=settings.ytdlp_cookies_file or None,
-            )
-            video_path = dl_result.path
-            title, duration = dl_result.title, dl_result.duration
-        else:
-            dl_result = download_audio_only(
-                url, job_id, work_dir, on_progress, cookies_file=settings.ytdlp_cookies_file or None,
-            )
-            audio_path, title, duration = dl_result.path, dl_result.title, dl_result.duration
+        with _stage_timer(job_id, "download"):
+            if mode == "video":
+                dl_result, audio_path = download_video_full(
+                    url, job_id, work_dir, on_progress, cookies_file=settings.ytdlp_cookies_file or None,
+                )
+                video_path = dl_result.path
+                title, duration = dl_result.title, dl_result.duration
+            else:
+                dl_result = download_audio_only(
+                    url, job_id, work_dir, on_progress, cookies_file=settings.ytdlp_cookies_file or None,
+                )
+                audio_path, title, duration = dl_result.path, dl_result.title, dl_result.duration
 
         if settings.max_video_duration_seconds and duration > settings.max_video_duration_seconds:
             raise DeterministicPipelineError(
@@ -121,33 +147,36 @@ def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str
         if not has_audio_stream(audio_path):
             raise DeterministicPipelineError("El video no tiene pista de audio")
 
-        segments = transcribe(
-            audio_path,
-            model_name=settings.whisper_model,
-            device=settings.whisper_device,
-            compute_type=settings.whisper_compute_type,
-            beam_size=settings.whisper_beam_size,
-            vad_min_silence_ms=settings.whisper_vad_min_silence_ms,
-            vad_speech_pad_ms=settings.whisper_vad_speech_pad_ms,
-            audio_duration_seconds=duration,
-            on_progress=on_progress,
-        )
+        with _stage_timer(job_id, "transcribe"):
+            segments = transcribe(
+                audio_path,
+                model_name=settings.whisper_model,
+                device=settings.whisper_device,
+                compute_type=settings.whisper_compute_type,
+                beam_size=settings.whisper_beam_size,
+                vad_min_silence_ms=settings.whisper_vad_min_silence_ms,
+                vad_speech_pad_ms=settings.whisper_vad_speech_pad_ms,
+                audio_duration_seconds=duration,
+                on_progress=on_progress,
+            )
         if not segments:
             raise DeterministicPipelineError("No se detectó habla en el audio")
 
-        translated = translate(
-            segments,
-            target_lang=target_lang,
-            batch_size=settings.translate_batch_size,
-            on_progress=on_progress,
-        )
+        with _stage_timer(job_id, "translate"):
+            translated = translate(
+                segments,
+                target_lang=target_lang,
+                batch_size=settings.translate_batch_size,
+                on_progress=on_progress,
+            )
 
         safe_title = sanitize_filename(title)
         srt_name = f"{safe_title}_{target_lang}.srt"
         srt_path = make_srt(translated, work_dir / srt_name)
 
         srt_key = f"{job_id}/{srt_name}"
-        upload_file(settings, srt_path, srt_key)
+        with _stage_timer(job_id, "upload_srt"):
+            upload_file(settings, srt_path, srt_key)
 
         result: dict[str, Any] = {
             "title": title,
@@ -165,10 +194,12 @@ def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str
         if mode == "video" and video_path is not None and video_path.exists():
             burned_name = f"{safe_title}_subtitulado.mp4"
             burned_path = work_dir / burned_name
-            burn_subs(video_path, srt_path, burned_path, settings=settings, on_progress=on_progress)
+            with _stage_timer(job_id, "burn"):
+                burn_subs(video_path, srt_path, burned_path, settings=settings, on_progress=on_progress)
 
             video_key = f"{job_id}/{burned_name}"
-            upload_file(settings, burned_path, video_key)
+            with _stage_timer(job_id, "upload_video"):
+                upload_file(settings, burned_path, video_key)
             result["video_key"] = video_key
             result["video_filename"] = burned_name
             result["video_size_mb"] = round(burned_path.stat().st_size / (1024 * 1024), 1)

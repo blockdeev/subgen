@@ -4,6 +4,8 @@ mockeado: yt-dlp, deep-translator, ffmpeg, S3, Redis). Correr desde
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+import subprocess
+import tempfile
 
 import pytest
 import yt_dlp
@@ -409,6 +411,100 @@ class TestBurnHelpers:
         fake_result = SimpleNamespace(stdout="N/A\n", returncode=1)
         monkeypatch.setattr(burn_module.subprocess, "run", lambda *a, **kw: fake_result)
         assert burn_module.probe_duration_seconds(Path("video.mp4")) == 0.0
+
+
+class TestFFmpegPipeHandling:
+    """Test real, con ffmpeg de verdad (sin mocks): antes, `_run_ffmpeg_with_progress`
+    usaba `process.communicate()` mientras un thread aparte ya estaba
+    leyendo `process.stdout` de forma independiente para el progreso — dos
+    consumidores sobre el mismo pipe al mismo tiempo, comportamiento
+    indefinido con riesgo real de colgarse. Este test genera más stderr
+    que el buffer de pipe típico de Linux (64KB) a propósito, para probar
+    bajo carga real que el fix (un thread dedicado por cada pipe) no se
+    cuelga ni pierde datos.
+    """
+
+    def test_does_not_hang_with_large_stderr_output(self):
+        import shutil as shutil_module
+
+        if shutil_module.which("ffmpeg") is None:
+            pytest.skip("ffmpeg no disponible en este entorno")
+
+        from app.pipeline.burn import _run_ffmpeg_with_progress
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out.mp4"
+            cmd = [
+                "ffmpeg", "-f", "lavfi", "-i", "testsrc=duration=25:size=640x480:rate=25",
+                "-loglevel", "debug",  # a propósito: genera MUCHO más stderr que lo normal
+                "-c:v", "libx264", "-preset", "ultrafast", "-y",
+                "-progress", "pipe:1", "-nostats",
+                str(output),
+            ]
+            events: list = []
+            returncode, stderr = _run_ffmpeg_with_progress(
+                cmd, total_seconds=25.0, timeout_seconds=90, on_progress=events.append,
+            )
+            output_exists = output.exists()
+            output_size = output.stat().st_size if output_exists else 0
+
+        assert returncode == 0
+        assert output_exists and output_size > 0
+        assert len(stderr) > 64 * 1024, (
+            f"solo se capturaron {len(stderr)} bytes de stderr -- si el pipe se "
+            "hubiera llenado y bloqueado como en el bug original, esto sería "
+            "mucho menor (truncado) en vez de completo"
+        )
+        # El progreso también se reportó bien mientras tanto -- confirma que
+        # ambos pipes (stdout de progreso Y stderr) se drenaron en paralelo
+        # sin pisarse.
+        assert len(events) > 0
+
+    def test_kills_orphaned_process_on_unexpected_interruption(self, monkeypatch):
+        """Bug real encontrado en producción: `SoftTimeLimitExceeded` de
+        Celery (1700s) es MENOR al timeout propio de FFmpeg (1800s), así
+        que en la práctica siempre se dispara primero -- e interrumpe
+        `process.wait()` sin pasar por nuestro `except
+        subprocess.TimeoutExpired`. Sin el fix, el proceso de FFmpeg
+        quedaba corriendo huérfano en el contenedor para siempre. Acá
+        simulamos esa interrupción externa con un proceso real."""
+        import shutil as shutil_module
+
+        if shutil_module.which("ffmpeg") is None:
+            pytest.skip("ffmpeg no disponible en este entorno")
+
+        from app.pipeline.burn import _run_ffmpeg_with_progress
+
+        captured: dict = {}
+        original_wait = subprocess.Popen.wait
+        call_count = {"n": 0}
+
+        def failing_wait(self, *a, **kw):
+            captured["proc"] = self
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Simula SoftTimeLimitExceeded interrumpiendo a mitad de
+                # camino -- una excepción que NO es subprocess.TimeoutExpired.
+                raise RuntimeError("interrupción externa simulada")
+            return original_wait(self, *a, **kw)
+
+        monkeypatch.setattr(subprocess.Popen, "wait", failing_wait)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "out.mp4"
+            cmd = [
+                "ffmpeg", "-f", "lavfi", "-i", "testsrc=duration=30:size=320x240:rate=10",
+                "-c:v", "libx264", "-preset", "ultrafast", "-y",
+                "-progress", "pipe:1", "-nostats",
+                str(output),
+            ]
+            with pytest.raises(RuntimeError):
+                _run_ffmpeg_with_progress(
+                    cmd, total_seconds=30.0, timeout_seconds=60, on_progress=lambda e: None,
+                )
+
+        proc = captured["proc"]
+        assert proc.poll() is not None, "el proceso de ffmpeg quedó huérfano corriendo"
 
 
 class TestHasAudioStream:

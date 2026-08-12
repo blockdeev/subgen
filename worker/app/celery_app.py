@@ -29,12 +29,25 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     # acks_late + prefetch=1: si un worker se cae a mitad de una tarea, la
-    # tarea vuelve a la cola y la toma otro worker en vez de perderse.
+    # tarea vuelve a la cola y la toma otro worker en vez de perderse —
+    # pero SOLO si visibility_timeout (abajo) está bien configurado. Sin
+    # eso, Redis usa su default de 3600s antes de considerar "perdido" el
+    # mensaje no confirmado, dejando la tarea en limbo hasta una hora
+    # después de un crash real (confirmado en producción: un worker se
+    # cayó a mitad de un quemado largo, y el job quedó mostrando el último
+    # progreso conocido sin que nadie lo retomara).
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_time_limit=settings.celery_task_time_limit,
     task_soft_time_limit=settings.celery_task_soft_time_limit,
     result_expires=settings.cleanup_max_age_hours * 3600,
+    # Tiene que ser mayor al tiempo máximo que puede durar una tarea
+    # (si no, Redis redistribuye el mensaje a otro worker MIENTRAS la
+    # tarea original todavía está corriendo legítimamente) pero no mucho
+    # más que eso — si no, un crash real tarda demasiado en recuperarse.
+    broker_transport_options={
+        "visibility_timeout": settings.celery_task_time_limit + 300,
+    },
     beat_schedule={
         "cleanup-expired-outputs": {
             "task": "app.tasks.cleanup_expired_outputs",

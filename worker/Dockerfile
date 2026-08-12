@@ -25,8 +25,13 @@ RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
 FROM python:3.11-slim AS runtime
 
 # El worker SÍ necesita ffmpeg (extracción de audio + quemado de subs).
+# procps (ps, top) no es necesario para correr la app — es solo para poder
+# diagnosticar el contenedor con `docker exec ... ps aux` cuando hace
+# falta (python:3.11-slim no lo trae por default, y nos hizo falta más de
+# una vez para debuggear problemas reales de procesos huérfanos).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1000 subgen && \
