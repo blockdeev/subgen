@@ -33,6 +33,25 @@ def stub_task_error():
     return {"exc": None}
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """El limiter de slowapi es un singleton en memoria a nivel de módulo
+    (`app.rate_limit.limiter`) que persiste estado ENTRE tests dentro del
+    mismo proceso -- sin esto, cuántas veces pasó un test antes afecta si
+    el siguiente choca con el límite, dependiendo del orden de ejecución
+    (nos pasó de verdad: agregar 2 tests nuevos hizo fallar otros que
+    nunca tocaron rate limiting). Se resetea antes de CADA test, así el
+    límite de 5/minute siempre arranca en cero salvo que el test mismo
+    lo agote a propósito (como hace TestRateLimit).
+    """
+    try:
+        from app.rate_limit import limiter
+        limiter.limiter.storage.reset()
+    except Exception:
+        pass  # en los tests del worker no existe app.rate_limit -- no pasa nada
+    yield
+
+
 @pytest.fixture
 def register_stub_task(stub_task_result, stub_task_error):
     """Registra, bajo el mismo nombre que usa la API para encolar
@@ -49,7 +68,7 @@ def register_stub_task(stub_task_result, stub_task_error):
     celery_client.conf.result_backend = "cache+memory://"
 
     @celery_client.task(name=TASK_NAME, bind=True)
-    def _stub(self, job_id, url, target_lang, mode):
+    def _stub(self, job_id, url, target_lang, mode, output_fps=30):
         if stub_task_error.get("exc") is not None:
             raise stub_task_error["exc"]
         return dict(stub_task_result)

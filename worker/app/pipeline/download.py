@@ -174,7 +174,7 @@ def download_video_full(
     import yt_dlp
 
     ydl_opts = _maybe_add_cookies({
-        "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
+        "format": "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
         "outtmpl": str(downloads_dir / job_id) + ".%(ext)s",
         "merge_output_format": "mp4",
         "quiet": True,

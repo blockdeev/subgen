@@ -19,7 +19,7 @@ settings = get_settings()
 @limiter.limit(settings.rate_limit_create_job)
 async def create_job(request: Request, payload: JobCreateRequest) -> JobCreateResponse:
     job_id = uuid.uuid4().hex[:12]
-    enqueue_job(job_id, payload.url, payload.target_lang, payload.mode)
+    enqueue_job(job_id, payload.url, payload.target_lang, payload.mode, payload.output_fps)
     return JobCreateResponse(job_id=job_id)
 
 

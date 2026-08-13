@@ -24,6 +24,8 @@
 
       'translate.label': 'Traducir a:',
       'translate.hint': 'Esto traduce los SUBTÍTULOS. El idioma de esta página se cambia con el botón "EN" de arriba.',
+      'fps.label': 'Calidad de video:',
+      'fps.hint': 'Solo aplica en modo video. 30fps es prácticamente indistinguible de 60 para una charla hablada, y quema los subtítulos bastante más rápido.',
 
       'actions.srt.label': 'Solo subtítulos',
       'actions.srt.desc': 'Genera el archivo .SRT\nMás rápido',
@@ -82,6 +84,8 @@
 
       'translate.label': 'Translate to:',
       'translate.hint': 'This translates the SUBTITLES. This page\'s language is changed with the "ES" button above.',
+      'fps.label': 'Video quality:',
+      'fps.hint': 'Only applies to video mode. 30fps is nearly indistinguishable from 60 for a spoken talk, and burns subtitles considerably faster.',
 
       'actions.srt.label': 'Subtitles only',
       'actions.srt.desc': 'Generates the .SRT file\nFaster',

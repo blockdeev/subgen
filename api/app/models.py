@@ -23,6 +23,12 @@ class JobCreateRequest(BaseModel):
     url: str = Field(..., min_length=8, max_length=2048)
     target_lang: str = Field(default="es")
     mode: JobMode = Field(default="srt")
+    output_fps: Literal[30, 60] = Field(
+        default=30,
+        description="Solo aplica en modo video. 30fps es visualmente casi "
+        "indistinguible de 60 para una charla hablada y reduce a la mitad "
+        "el trabajo de quemado (encoder + libass, que es mono-hilo).",
+    )
 
     @field_validator("url")
     @classmethod
@@ -65,6 +71,7 @@ class JobResult(BaseModel):
     video_key: Optional[str] = None
     video_filename: Optional[str] = None
     video_size_mb: Optional[float] = None
+    output_fps: Optional[int] = None
 
 
 class JobStatusResponse(BaseModel):

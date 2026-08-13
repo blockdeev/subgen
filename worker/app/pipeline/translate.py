@@ -3,13 +3,26 @@
 Lógica de negocio TAL CUAL el original: lotes de 25, y si falla el lote
 completo se reintenta ítem por ítem, y si un ítem individual falla se
 conserva el texto en inglés (degradación silenciosa intencional, no la
-tocamos). Lo nuevo es tipado, progreso por stage_pct, y dejar que un fallo
-en la construcción del traductor (p.ej. sin red) se propague para que la
-tarea Celery decida si reintenta.
+tocamos).
+
+Lo nuevo (pedido explícito, la traducción era ~15% del job y son puros
+lotes secuenciales de latencia de red): los lotes se mandan en paralelo
+con un pool de threads, en vez de uno por uno. Cada thread arma su PROPIA
+instancia de `GoogleTranslator` (no comparten una entre sí -- evita
+depender de que `requests.Session` sea thread-safe, que no es una
+garantía documentada de la librería). Si un lote falla con algo que
+parece ser un rate-limit de Google, ESE thread en particular espera con
+backoff exponencial y reintenta -- no se baja la concurrencia del pool
+entero (no es trivial re-dimensionar un ThreadPoolExecutor en caliente),
+pero el efecto práctico es parecido: los threads afectados se frenan
+solos sin bloquear a los que están yendo bien.
 """
 from __future__ import annotations
 
 import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from app.pipeline.errors import TransientPipelineError
@@ -17,6 +30,10 @@ from app.pipeline.progress_types import ProgressCallback, StageProgress, noop_pr
 from app.pipeline.transcribe import Segment
 
 logger = logging.getLogger(__name__)
+
+_RATE_LIMIT_MARKERS = ("429", "too many requests", "quota", "rate limit", "rate-limit")
+_MAX_BATCH_RETRIES = 3
+_BACKOFF_CAP_SECONDS = 8.0
 
 
 @dataclass(frozen=True)
@@ -27,61 +44,107 @@ class TranslatedSegment:
     text: str
 
 
-def translate(
-    segments: list[Segment],
-    *,
-    target_lang: str = "es",
-    batch_size: int = 25,
-    on_progress: ProgressCallback = noop_progress,
-) -> list[TranslatedSegment]:
+def _looks_like_rate_limit(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
+
+
+def _translate_batch_with_fallback(
+    target_lang: str, texts: list[str], batch_label: str,
+) -> list[str]:
+    """Traduce un lote completo; si parece rate-limit, reintenta con
+    backoff exponencial (hasta `_MAX_BATCH_RETRIES` veces). Cualquier otro
+    tipo de fallo (o agotar los reintentos de rate-limit) cae al fallback
+    ítem por ítem del original, sin cambiarlo."""
     from deep_translator import GoogleTranslator
 
-    on_progress(StageProgress(stage="translating", stage_pct=0.0, message_key="status.translating"))
+    translator = GoogleTranslator(source="en", target=target_lang)
 
-    try:
-        translator = GoogleTranslator(source="en", target=target_lang)
-    except Exception as exc:  # noqa: BLE001 - no controlamos las excepciones de la lib externa
-        # Instanciar el traductor solo falla por problemas de red/DNS/servicio
-        # caído: es el único punto de translate() que consideramos transitorio
-        # y reintentable. El resto (fallos por lote/ítem) se degrada en
-        # silencio más abajo, igual que en el original.
-        raise TransientPipelineError(f"No se pudo inicializar el traductor: {exc}") from exc
-    out: list[TranslatedSegment] = []
-    total = len(segments)
-    if total == 0:
-        return out
-
-    for i in range(0, total, batch_size):
-        batch = segments[i : i + batch_size]
-        texts = [s.text for s in batch]
+    for attempt in range(_MAX_BATCH_RETRIES + 1):
         try:
-            results = translator.translate_batch(texts)
-        except Exception:
-            logger.warning("Fallo el lote de traducción [%d:%d], reintentando ítem por ítem", i, i + batch_size)
-            results = []
+            return list(translator.translate_batch(texts))
+        except Exception as exc:  # noqa: BLE001
+            if _looks_like_rate_limit(exc) and attempt < _MAX_BATCH_RETRIES:
+                backoff = min(2.0 ** attempt, _BACKOFF_CAP_SECONDS)
+                logger.warning(
+                    "Rate limit de Google Translate en lote %s (intento %d/%d), esperando %.1fs",
+                    batch_label, attempt + 1, _MAX_BATCH_RETRIES, backoff,
+                )
+                time.sleep(backoff)
+                continue
+            logger.warning("Fallo el lote de traducción %s, reintentando ítem por ítem", batch_label)
+            results: list[str] = []
             for t in texts:
                 try:
                     results.append(translator.translate(t))
                 except Exception:
                     results.append(t)  # degradación intencional: se conserva el original
+            return results
 
-        for seg, txt in zip(batch, results):
+    return texts  # inalcanzable en la práctica, deja el type checker conforme
+
+
+def translate(
+    segments: list[Segment],
+    *,
+    target_lang: str = "es",
+    batch_size: int = 25,
+    max_concurrency: int = 4,
+    on_progress: ProgressCallback = noop_progress,
+) -> list[TranslatedSegment]:
+    on_progress(StageProgress(stage="translating", stage_pct=0.0, message_key="status.translating"))
+
+    try:
+        from deep_translator import GoogleTranslator
+
+        GoogleTranslator(source="en", target=target_lang)  # smoke test, ver docstring de más abajo
+    except Exception as exc:  # noqa: BLE001 - no controlamos las excepciones de la lib externa
+        # Instanciar el traductor solo falla por problemas de red/DNS/servicio
+        # caído: es el único punto de translate() que consideramos transitorio
+        # y reintentable a nivel tarea Celery. El resto (fallos por lote/ítem)
+        # se degrada en silencio más abajo, igual que en el original.
+        raise TransientPipelineError(f"No se pudo inicializar el traductor: {exc}") from exc
+
+    total = len(segments)
+    if total == 0:
+        return []
+
+    batches = [segments[i : i + batch_size] for i in range(0, total, batch_size)]
+    results_by_batch: dict[int, list[str]] = {}
+    lock = threading.Lock()
+    completed_batches = 0
+
+    def _run_batch(idx: int, batch: list[Segment]) -> tuple[int, list[str]]:
+        texts = [s.text for s in batch]
+        label = f"[{idx * batch_size}:{idx * batch_size + len(batch)}]"
+        return idx, _translate_batch_with_fallback(target_lang, texts, label)
+
+    with ThreadPoolExecutor(max_workers=max(1, max_concurrency)) as executor:
+        futures = [executor.submit(_run_batch, i, b) for i, b in enumerate(batches)]
+        for future in as_completed(futures):
+            idx, results = future.result()
+            with lock:
+                results_by_batch[idx] = results
+                completed_batches += 1
+                done_segments = sum(len(batches[j]) for j in results_by_batch)
+                pct = completed_batches / len(batches) * 100
+            on_progress(
+                StageProgress(
+                    stage="translating", stage_pct=pct,
+                    message_key="status.translating_progress",
+                    message_params={"done": done_segments, "total": total},
+                )
+            )
+
+    out: list[TranslatedSegment] = []
+    for i, batch in enumerate(batches):
+        for seg, txt in zip(batch, results_by_batch[i]):
             out.append(
                 TranslatedSegment(
                     start=seg.start, end=seg.end,
                     text_original=seg.text, text=(txt or seg.text),
                 )
             )
-
-        done = min(i + batch_size, total)
-        pct = done / total * 100
-        on_progress(
-            StageProgress(
-                stage="translating", stage_pct=pct,
-                message_key="status.translating_progress",
-                message_params={"done": done, "total": total},
-            )
-        )
 
     on_progress(StageProgress(stage="translating", stage_pct=100.0, message_key="status.translating_done"))
     return out

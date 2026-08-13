@@ -183,7 +183,10 @@ class TestTranslate:
         with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
             translate(self._segments(60), target_lang="es", batch_size=25)
         call_sizes = [len(call.args[0]) for call in fake_translator.translate_batch.call_args_list]
-        assert call_sizes == [25, 25, 10]
+        # Con concurrencia real, el ORDEN de ejecución no está garantizado
+        # (los 3 lotes se someten a la vez a un pool de 4 workers) -- lo que
+        # sí tiene que valer siempre es el conjunto de tamaños de lote.
+        assert sorted(call_sizes) == [10, 25, 25]
 
     def test_empty_segments_returns_empty(self):
         assert translate([], target_lang="es") == []
@@ -192,6 +195,97 @@ class TestTranslate:
         with patch("deep_translator.GoogleTranslator", side_effect=ConnectionError("dns fail")):
             with pytest.raises(TransientPipelineError):
                 translate([Segment(start=0, end=1, text="hi")], target_lang="es")
+
+    def test_order_preserved_even_when_later_batch_finishes_first(self):
+        """El batch 0 tarda más que el batch 1 -- si el reensamblado
+        dependiera del orden de FINALIZACIÓN en vez del índice del batch,
+        esto rompería el orden de los segmentos en el resultado."""
+        import time as time_module
+
+        def slow_or_fast(texts):
+            # Lote grande (batch 0, 25 items) se demora; lote chico
+            # (batch 1, 5 items) termina primero.
+            if len(texts) == 25:
+                time_module.sleep(0.15)
+            return [f"tr-{t}" for t in texts]
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.side_effect = slow_or_fast
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate(self._segments(30), target_lang="es", batch_size=25, max_concurrency=4)
+
+        assert [s.text_original for s in result] == [f"hello {i}" for i in range(30)]
+        assert result[0].text == "tr-hello 0"
+        assert result[29].text == "tr-hello 29"
+
+    def test_batches_run_concurrently_not_sequentially(self):
+        """Con 4 lotes de 0.1s cada uno y concurrencia 4, el total tiene
+        que acercarse a 0.1s (todos en paralelo), no a 0.4s (uno por uno)."""
+        import time as time_module
+
+        def slow_batch(texts):
+            time_module.sleep(0.1)
+            return texts
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.side_effect = slow_batch
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            t0 = time_module.monotonic()
+            translate(self._segments(4), target_lang="es", batch_size=1, max_concurrency=4)
+            elapsed = time_module.monotonic() - t0
+
+        assert elapsed < 0.35, f"tardó {elapsed:.2f}s -- parece secuencial, no concurrente"
+
+    def test_rate_limit_error_triggers_backoff_and_retry(self, monkeypatch):
+        import app.pipeline.translate as translate_module
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: sleeps.append(s))
+
+        fake_translator = MagicMock()
+        # Falla las primeras 2 veces con algo que parece rate-limit, tercera vez ok.
+        fake_translator.translate_batch.side_effect = [
+            Exception("429 Too Many Requests"),
+            Exception("429 Too Many Requests"),
+            ["ok"],
+        ]
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hi")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "ok"
+        assert len(sleeps) == 2, "tendría que haber esperado antes del 2do y 3er intento"
+        assert fake_translator.translate_batch.call_count == 3
+
+    def test_non_rate_limit_error_does_not_retry_goes_straight_to_fallback(self, monkeypatch):
+        import app.pipeline.translate as translate_module
+
+        sleeps: list[float] = []
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: sleeps.append(s))
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.side_effect = Exception("500 Internal Server Error")
+        fake_translator.translate.side_effect = lambda t: f"item-{t}"
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hi")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "item-hi"
+        assert sleeps == [], "un error que no parece rate-limit no debería esperar/reintentar el lote"
+        assert fake_translator.translate_batch.call_count == 1
+
+    def test_rate_limit_exhausts_retries_then_falls_back(self, monkeypatch):
+        import app.pipeline.translate as translate_module
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.side_effect = Exception("429 Too Many Requests")
+        fake_translator.translate.side_effect = lambda t: f"item-{t}"
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hi")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "item-hi"
+        # 1 intento inicial + 3 reintentos = 4 llamadas a translate_batch antes de rendirse
+        assert fake_translator.translate_batch.call_count == 4
 
 
 # ── burn: el estilo quemado tiene que ser EXACTAMENTE el validado ─────────
@@ -207,6 +301,53 @@ def test_burn_style_matches_validated_original():
         "FontName=Arial,FontSize=20,PrimaryColour=&HFFFFFF&,"
         "OutlineColour=&H000000&,BorderStyle=1,Outline=2,Shadow=1,MarginV=25"
     )
+
+
+class TestBurnSubsOutputFps:
+    """El filtro `fps=N` tiene que ir ANTES de `subtitles=` en la cadena de
+    -vf, no como opción de salida separada -- si no, libass sigue
+    procesando todos los frames del source y no se ahorra nada."""
+
+    def _settings(self):
+        return SimpleNamespace(
+            burn_font_name="Arial", burn_font_size=20,
+            burn_primary_colour="&HFFFFFF&", burn_outline_colour="&H000000&",
+            burn_border_style=1, burn_outline=2, burn_shadow=1, burn_margin_v=25,
+            ffmpeg_preset="fast", ffmpeg_crf=23, ffmpeg_timeout_seconds=1800,
+        )
+
+    def _captured_vf(self, monkeypatch, tmp_path, output_fps):
+        import app.pipeline.burn as burn_module
+
+        captured = {}
+
+        def fake_run(cmd, total_seconds, timeout_seconds, on_progress):
+            captured["cmd"] = cmd
+            (tmp_path / "out.mp4").write_bytes(b"x" * 2000)  # burn_subs valida tamaño > 1000
+            return 0, ""
+
+        monkeypatch.setattr(burn_module, "probe_duration_seconds", lambda p: 10.0)
+        monkeypatch.setattr(burn_module, "_run_ffmpeg_with_progress", fake_run)
+
+        burn_module.burn_subs(
+            tmp_path / "in.mp4", tmp_path / "in.srt", tmp_path / "out.mp4",
+            settings=self._settings(), output_fps=output_fps,
+        )
+        vf_index = captured["cmd"].index("-vf") + 1
+        return captured["cmd"][vf_index]
+
+    def test_fps_filter_comes_before_subtitles_filter(self, monkeypatch, tmp_path):
+        vf = self._captured_vf(monkeypatch, tmp_path, output_fps=30)
+        assert vf.startswith("fps=30,subtitles="), vf
+
+    def test_fps_60_in_filter_chain(self, monkeypatch, tmp_path):
+        vf = self._captured_vf(monkeypatch, tmp_path, output_fps=60)
+        assert vf.startswith("fps=60,subtitles="), vf
+
+    def test_zero_or_negative_fps_omits_the_filter_entirely(self, monkeypatch, tmp_path):
+        vf = self._captured_vf(monkeypatch, tmp_path, output_fps=0)
+        assert "fps=" not in vf
+        assert vf.startswith("subtitles="), vf
 
 
 # ── process_video: caminos de error de punta a punta, con I/O mockeado ────
@@ -274,6 +415,58 @@ def test_ffmpeg_failure_is_not_retried(task_env, tmp_path, monkeypatch):
 
     with pytest.raises(BurnError):
         task_env.process_video.apply(args=("job3", "https://example.com/v", "es", "video")).get()
+
+
+class TestOutputFpsPropagation:
+    """El request puede elegir 30/60fps; si no manda nada (output_fps=0,
+    el default del parámetro), tiene que caer al default del server."""
+
+    def _setup_video_mode(self, task_env, tmp_path, monkeypatch):
+        from app.pipeline.download import DownloadResult
+        from app.pipeline.translate import TranslatedSegment
+
+        video_path = tmp_path / "video.mp4"
+        video_path.write_bytes(b"fake video bytes")
+        monkeypatch.setattr(
+            task_env, "download_video_full",
+            lambda *a, **kw: (DownloadResult(path=video_path, title="t", duration=10.0), tmp_path / "audio.mp3"),
+        )
+        monkeypatch.setattr(task_env, "transcribe", lambda *a, **kw: [Segment(start=0, end=1, text="hi")])
+        monkeypatch.setattr(
+            task_env, "translate",
+            lambda *a, **kw: [TranslatedSegment(start=0, end=1, text_original="hi", text="hola")],
+        )
+        burn_mock = MagicMock(side_effect=lambda video_path, srt_path, output_path, **kw: output_path.write_bytes(b"x" * 100) or output_path)
+        monkeypatch.setattr(task_env, "burn_subs", burn_mock)
+        return burn_mock
+
+    def test_explicit_60fps_reaches_burn_subs(self, task_env, tmp_path, monkeypatch):
+        burn_mock = self._setup_video_mode(task_env, tmp_path, monkeypatch)
+        result = task_env.process_video.apply(
+            args=("job11", "https://example.com/v", "es", "video", 60)
+        ).get()
+        assert burn_mock.call_args.kwargs["output_fps"] == 60
+        assert result["output_fps"] == 60
+
+    def test_zero_falls_back_to_server_default(self, task_env, tmp_path, monkeypatch):
+        burn_mock = self._setup_video_mode(task_env, tmp_path, monkeypatch)
+        monkeypatch.setattr(task_env.settings, "default_burn_fps", 30)
+        result = task_env.process_video.apply(
+            args=("job12", "https://example.com/v", "es", "video", 0)
+        ).get()
+        assert burn_mock.call_args.kwargs["output_fps"] == 30
+        assert result["output_fps"] == 30
+
+    def test_omitted_argument_also_falls_back_to_default(self, task_env, tmp_path, monkeypatch):
+        # Ni siquiera se manda el 5to argumento -- confirma que las tareas
+        # viejas (tests existentes con 4 args) siguen andando igual.
+        burn_mock = self._setup_video_mode(task_env, tmp_path, monkeypatch)
+        monkeypatch.setattr(task_env.settings, "default_burn_fps", 30)
+        result = task_env.process_video.apply(
+            args=("job13", "https://example.com/v", "es", "video")
+        ).get()
+        assert burn_mock.call_args.kwargs["output_fps"] == 30
+        assert result["output_fps"] == 30
 
 
 def test_successful_srt_only_run_returns_expected_shape(task_env, tmp_path, monkeypatch):

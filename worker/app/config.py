@@ -30,6 +30,11 @@ class WorkerSettings(BaseSettings):
 
     # Traducción
     translate_batch_size: int = Field(default=25)
+    # Lotes en paralelo, no secuenciales -- era ~15% del job entero en
+    # pura latencia de red esperando uno por uno. 4-6 es razonable sin
+    # gatillar rate-limiting agresivo de Google; cada lote individual ya
+    # tiene su propio backoff si lo pega igual (ver translate.py).
+    translate_concurrency: int = Field(default=4)
 
     # Límites de negocio
     max_video_duration_seconds: int = Field(default=3600, description="0 = sin límite")
@@ -52,6 +57,11 @@ class WorkerSettings(BaseSettings):
     burn_margin_v: int = Field(default=25)
     ffmpeg_preset: str = Field(default="fast")
     ffmpeg_crf: int = Field(default=23)
+    # Default de frame rate de salida al quemar subtítulos (si el request
+    # no especifica uno). 30fps es casi indistinguible de 60fps para una
+    # charla hablada y reduce a la mitad el trabajo tanto de libass (que es
+    # mono-hilo) como de x264. 0 = no tocar el frame rate nativo del source.
+    default_burn_fps: int = Field(default=30)
     ffmpeg_timeout_seconds: int = Field(default=1800)
 
     # Almacenamiento S3-compatible (ver README, sección "Almacenamiento")

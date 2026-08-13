@@ -32,7 +32,7 @@ celery_client.conf.update(
 )
 
 
-def enqueue_job(job_id: str, url: str, target_lang: str, mode: str) -> None:
+def enqueue_job(job_id: str, url: str, target_lang: str, mode: str, output_fps: int = 30) -> None:
     # OJO: `celery_client.send_task(...)` ignora `task_always_eager` (Celery
     # emite el warning `AlwaysEagerIgnored` y manda igual por la red) porque
     # send_task() está pensado justo para el caso "no tengo la tarea
@@ -50,7 +50,7 @@ def enqueue_job(job_id: str, url: str, target_lang: str, mode: str) -> None:
     # que la ruta pueda devolver 503 (reintentable) en vez de un 500 plano.
     try:
         celery_client.signature(
-            TASK_NAME, args=[job_id, url, target_lang, mode], task_id=job_id,
+            TASK_NAME, args=[job_id, url, target_lang, mode, output_fps], task_id=job_id,
         ).apply_async()
     except (OperationalError, RuntimeError, ConnectionError, OSError) as exc:
         raise QueueUnavailableError(f"No se pudo encolar el trabajo: {exc}") from exc

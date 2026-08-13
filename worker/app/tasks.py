@@ -115,12 +115,15 @@ def _publish_terminal(job_id: str, status: str, **extra: Any) -> None:
     retry_jitter=True,
     max_retries=settings.celery_max_retries,
 )
-def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str) -> dict[str, Any]:
+def process_video(
+    self: Task, job_id: str, url: str, target_lang: str, mode: str, output_fps: int = 0,
+) -> dict[str, Any]:
     """mode="srt" → solo subtítulos. mode="video" → subtítulos + video quemado."""
     job_id_var.set(job_id)  # correlación en los logs JSON de este proceso worker
     on_progress = _make_on_progress(self, job_id, mode)
     work_dir = Path(settings.work_dir) / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    effective_fps = output_fps if output_fps > 0 else settings.default_burn_fps
 
     try:
         video_path: Path | None = None
@@ -167,6 +170,7 @@ def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str
                 segments,
                 target_lang=target_lang,
                 batch_size=settings.translate_batch_size,
+                max_concurrency=settings.translate_concurrency,
                 on_progress=on_progress,
             )
 
@@ -195,7 +199,8 @@ def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str
             burned_name = f"{safe_title}_subtitulado.mp4"
             burned_path = work_dir / burned_name
             with _stage_timer(job_id, "burn"):
-                burn_subs(video_path, srt_path, burned_path, settings=settings, on_progress=on_progress)
+                burn_subs(video_path, srt_path, burned_path, settings=settings,
+                          output_fps=effective_fps, on_progress=on_progress)
 
             video_key = f"{job_id}/{burned_name}"
             with _stage_timer(job_id, "upload_video"):
@@ -203,6 +208,7 @@ def process_video(self: Task, job_id: str, url: str, target_lang: str, mode: str
             result["video_key"] = video_key
             result["video_filename"] = burned_name
             result["video_size_mb"] = round(burned_path.stat().st_size / (1024 * 1024), 1)
+            result["output_fps"] = effective_fps
 
         _publish_terminal(job_id, "completed", progress=100, result=result)
         return result

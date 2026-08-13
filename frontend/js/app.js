@@ -146,6 +146,7 @@
   async function startProcess(mode) {
     const url = $('urlInput').value.trim();
     const lang = $('langSelect').value;
+    const outputFps = parseInt($('fpsSelect').value, 10);
     if (!url) { showError(t('error.url_required')); $('urlInput').focus(); return; }
 
     currentMode = mode;
@@ -166,7 +167,7 @@
       const resp = await fetch(`${apiBase()}/api/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, target_lang: lang, mode }),
+        body: JSON.stringify({ url, target_lang: lang, mode, output_fps: outputFps }),
       });
       if (!resp.ok) {
         const data = await resp.json().catch(() => ({}));

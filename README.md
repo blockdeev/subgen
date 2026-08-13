@@ -8,8 +8,9 @@ transcribir y Google Translate para traducir. Dos modos: solo el archivo
 
 Esta es la version migrada de un monolito Flask + threads a una
 arquitectura distribuida: **FastAPI + Celery + Redis**, containerizada,
-pensada para correr en 4 VPS separados (o en una sola maquina para
-desarrollo/demo).
+pensada para correr en varias VPS de Hetzner (ver
+[DEPLOYMENT.md](DEPLOYMENT.md) para el reparto recomendado), o en una
+sola maquina para desarrollo/demo.
 
 ```
 +--------------+     +-------------+     +--------------+     +--------------+
@@ -40,7 +41,7 @@ para el porque.
 - [Levantar en local](#levantar-en-local)
 - [Variables de entorno](#variables-de-entorno)
 - [Cookies de YouTube](#cookies-de-youtube)
-- [Despliegue distribuido en 4 VPS de Hetzner](#despliegue-distribuido-en-4-vps-de-hetzner)
+- [Despliegue distribuido](DEPLOYMENT.md)
 - [Correr los tests](#correr-los-tests)
 - [Decisiones de arquitectura](#decisiones-de-arquitectura)
 - [Seguridad](#seguridad)
@@ -151,96 +152,13 @@ funcionando con sitios que no bloquean por bots.
 
 ---
 
-## Despliegue distribuido en 4 VPS de Hetzner
+## Despliegue distribuido
 
-Docker Compose no orquesta multi-host: la forma de desplegar "distribuido"
-con compose solo (sin Kubernetes/Swarm, como pide el enunciado) es copiar
-el mismo `docker-compose.prod.yml` a las 4 VPS y, en cada una, levantar
-**unicamente** el servicio que le corresponde.
-
-### 1. Crear la red privada
-
-En el panel de Hetzner Cloud: **Networks -> Create Network**, rango
-`10.0.0.0/24` por ejemplo. Agrega las 4 VPS a esa red al crearlas (o
-despues, en la seccion Networks de cada servidor). Cada VPS va a tener una
-IP privada tipo `10.0.0.X` ademas de su IP publica.
-
-Anota las IPs privadas -- las vas a necesitar en el `.env` de cada nodo:
-
-| VPS | Rol | IP privada (ejemplo) |
-|---|---|---|
-| VPS 1 | `api` | `10.0.0.11` |
-| VPS 2 | `redis` (+ `minio` si elegis self-hosted) | `10.0.0.12` |
-| VPS 3 | `worker-1` | `10.0.0.13` |
-| VPS 4 | `worker-2` | `10.0.0.14` |
-
-### 2. Instalar Docker en las 4
-
-```bash
-curl -fsSL https://get.docker.com | sh
-```
-
-### 3. Copiar el repo a las 4
-
-```bash
-git clone <tu-repo> subgen && cd subgen
-```
-
-(Solo hace falta el codigo fuente para el build; no hace falta copiar
-`node_modules` ni nada pesado -- `.dockerignore` ya se encarga.)
-
-### 4. Configurar el `.env` de cada VPS
-
-Cada VPS necesita su **propio** `.env`, distinto entre si. Puntos clave:
-
-- **VPS 2 (redis)**: `SUBGEN_REDIS_URL` puede quedar con el default
-  (`redis://redis:6379/0`, resuelto dentro del propio contenedor). Si
-  hosteas MinIO aca tambien (ver [Almacenamiento](#almacenamiento)),
-  setea las credenciales S3.
-- **VPS 1 (api) y VPS 3/4 (workers)**: `SUBGEN_REDIS_URL` tiene que
-  apuntar a la IP PRIVADA de la VPS 2: `redis://10.0.0.12:6379/0`.
-- Las 4 necesitan las mismas `SUBGEN_S3_*` (mismo bucket).
-- Solo VPS 1 necesita `SUBGEN_S3_PUBLIC_ENDPOINT_URL` (la URL que va a usar
-  el navegador del usuario -- la de Hetzner Object Storage, o la IP/dominio
-  publico donde expongas tu MinIO).
-- Solo VPS 1 necesita `SUBGEN_CORS_ORIGINS` (el dominio publico de tu
-  frontend).
-
-### 5. Orden de arranque
-
-```bash
-# VPS 2 primero (todo depende de Redis):
-docker compose -f docker-compose.prod.yml up -d redis
-# si elegiste MinIO self-hosted en esta misma VPS:
-docker compose -f docker-compose.prod.yml --profile selfhosted-storage up -d minio
-
-# VPS 3 y VPS 4 (workers, en cualquier orden entre si):
-docker compose -f docker-compose.prod.yml up -d worker-1   # VPS 3, con Celery Beat
-docker compose -f docker-compose.prod.yml up -d worker-2   # VPS 4
-
-# VPS 1 al final:
-docker compose -f docker-compose.prod.yml up -d api
-```
-
-Los clientes de Redis/Celery reintentan la conexion automaticamente, asi
-que el orden no es estrictamente obligatorio -- pero arrancar Redis primero
-evita ruido de logs de reconexion al principio.
-
-### 6. Verificar
-
-```bash
-curl http://<ip-publica-vps1>/api/health
-```
-
-Y de ahi, correr el [checklist de verificacion manual](#checklist-de-verificacion-manual)
-completo antes de darlo por andando.
-
-### TLS / dominio propio
-
-`docker-compose.prod.yml` expone la API en el puerto 80 sin TLS. Para
-produccion real, pone un reverse proxy (Caddy o nginx + certbot) delante
-de la VPS 1 y apunta el puerto 443 ahi -- esta fuera del alcance de este
-proyecto de portfolio, pero es el paso obvio siguiente.
+Ver **[DEPLOYMENT.md](DEPLOYMENT.md)** para la guía completa: como se
+reparte en varias VPS de Hetzner, por que se agrupan api+redis+minio en
+una sola VPS chica en vez de una por servicio, por que se recomienda la
+linea CCX (vCPU dedicado) para los workers en vez de CPX (compartido), y
+los pasos de despliegue paso a paso.
 
 ---
 
@@ -330,7 +248,7 @@ credenciales). El worker sube el resultado al terminar; la API nunca lee
 el filesystem del worker, genera URLs pre-firmadas contra el mismo bucket.
 
 Por que: es el patron estandar para "un proceso genera un archivo, otro lo
-sirve" cuando estan en maquinas distintas, no depende de que las 4 VPS
+sirve" cuando estan en maquinas distintas, no depende de que las VPS
 compartan filesystem, escala a mas workers sin tocar infraestructura, y
 ademas **resolvio de paso una vulnerabilidad de path traversal** que tenia
 el codigo original (`SUBTITLES_DIR / filename` con el filename tomado
@@ -347,7 +265,7 @@ hay que montar NFS por la red privada, manejar permisos, y el servidor NFS
 es un punto unico de falla. Si preferis esta ruta, reemplaza
 `worker/app/storage.py` y `api/app/storage.py` por operaciones de
 filesystem sobre un volumen Docker montado desde el mismo NFS share en las
-4 VPS.
+VPS de worker.
 
 ### Progreso en tiempo real: Pub/Sub, no polling oculto
 
@@ -372,8 +290,9 @@ de uno -- que es justo lo que `worker-1`/`worker-2` demuestran.
 ### Limpieza automatica
 
 Celery Beat corre embebido en `worker-1` (flag `-B` de Celery), no como un
-quinto servicio -- dado que el enunciado fija 4 VPS. `worker-2` corre sin
-ese flag para que la tarea periodica de limpieza no se dispare duplicada.
+servicio aparte -- evita pedir una VPS extra solo para el scheduler. El
+resto de los workers (`worker-2`, `worker-3`, ...) corren sin ese flag
+para que la tarea periodica de limpieza no se dispare duplicada.
 
 ### Reintentos: solo para fallos transitorios de red
 

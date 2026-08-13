@@ -42,6 +42,21 @@ class TestCreateJobValidation:
         )
         assert resp.status_code == 422
 
+    def test_rejects_unsupported_output_fps(self, client):
+        resp = client.post(
+            "/api/jobs",
+            json={"url": "https://youtube.com/watch?v=abc123", "output_fps": 45},
+        )
+        assert resp.status_code == 422
+
+    def test_accepts_output_fps_30_and_60(self, client, stub_task_result):
+        for fps in (30, 60):
+            resp = client.post(
+                "/api/jobs",
+                json={"url": "https://youtube.com/watch?v=abc123", "output_fps": fps},
+            )
+            assert resp.status_code == 202
+
     def test_rejects_invalid_mode(self, client):
         resp = client.post(
             "/api/jobs",

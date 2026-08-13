@@ -133,13 +133,28 @@ def _parse_progress_stream(
 ) -> None:
     """Lee stdout de `-progress pipe:1` en un thread separado (para no
     bloquear el proceso principal mientras FFmpeg corre) y publica progreso
-    usando las funciones puras de arriba."""
+    usando las funciones puras de arriba.
+
+    De paso, loguea `fps`/`speed`/`frame` cada ~30s — diagnóstico para
+    correlacionar caídas de rendimiento con complejidad de escena
+    (oscila siguiendo el contenido) vs. throttling térmico (cae de forma
+    sostenida). No cambia el comportamiento, solo agrega visibilidad.
+    """
     assert process.stdout is not None
+    last_logged_at = started_at
     for block in iter_progress_blocks(iter(process.stdout.readline, "")):
         elapsed = time.monotonic() - started_at
         event = compute_progress(block, total_seconds=total_seconds, elapsed_seconds=elapsed)
         if event is not None:
             on_progress(event)
+
+        now = time.monotonic()
+        if now - last_logged_at >= 30:
+            logger.info(
+                "FFmpeg burn: t=%.0fs frame=%s fps=%s speed=%s",
+                elapsed, block.get("frame", "?"), block.get("fps", "?"), block.get("speed", "?"),
+            )
+            last_logged_at = now
 
 
 def _drain_stderr(process: "subprocess.Popen[str]", chunks: list[str]) -> None:
@@ -204,24 +219,35 @@ def burn_subs(
     output_path: Path,
     *,
     settings: Any,
+    output_fps: int = 0,
     on_progress: ProgressCallback = noop_progress,
 ) -> Path:
+    """`output_fps > 0` fuerza el frame rate de salida ANTES del filtro
+    `subtitles` en la cadena (`fps=N,subtitles=...`, no como opción de
+    salida separada) — a propósito: si el `fps=` va después de
+    componer los subtítulos, `libass` sigue procesando TODOS los frames
+    del source y el ahorro de trabajo nunca llega a pasar. Puesto antes,
+    reduce la entrada real que ve `libass` (mono-hilo) y también la
+    cantidad de frames que tiene que codificar `x264`.
+    `output_fps <= 0` no toca el frame rate (queda el nativo del source).
+    """
     total_seconds = probe_duration_seconds(video_path)
     on_progress(StageProgress(stage="burning", stage_pct=0.0, message_key="status.burning_start"))
 
     srt_esc = _escape_srt_path(srt_path)
     style = _build_style(settings)
+    fps_filter = f"fps={output_fps}," if output_fps > 0 else ""
 
     base_cmd = [
         "ffmpeg", "-i", str(video_path),
-        "-vf", f"subtitles={srt_esc}:force_style='{style}'",
+        "-vf", f"{fps_filter}subtitles={srt_esc}:force_style='{style}'",
         "-c:v", "libx264", "-preset", settings.ffmpeg_preset, "-crf", str(settings.ffmpeg_crf),
         "-c:a", "copy", "-y",
         "-progress", "pipe:1", "-nostats",
         str(output_path),
     ]
 
-    logger.info("FFmpeg: quemando subs en %s", video_path.name)
+    logger.info("FFmpeg: quemando subs en %s (output_fps=%s)", video_path.name, output_fps or "nativo")
     returncode, stderr = _run_ffmpeg_with_progress(
         base_cmd, total_seconds, settings.ffmpeg_timeout_seconds, on_progress
     )
@@ -230,7 +256,7 @@ def burn_subs(
         logger.warning("FFmpeg con force_style falló, reintentando sin él")
         fallback_cmd = [
             "ffmpeg", "-i", str(video_path),
-            "-vf", f"subtitles={srt_esc}",
+            "-vf", f"{fps_filter}subtitles={srt_esc}",
             "-c:v", "libx264", "-preset", settings.ffmpeg_preset, "-crf", str(settings.ffmpeg_crf),
             "-c:a", "copy", "-y",
             "-progress", "pipe:1", "-nostats",
