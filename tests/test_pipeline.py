@@ -824,7 +824,83 @@ class TestProgressPublisher:
 
 # ── tasks.py: rutas de excepción que todavía no tenían cobertura ─────────
 
+class TestCleanupStaleWorkdirs:
+    """Consecuencia directa de agregar el cancelar-job con SIGKILL: ese
+    kill no le da chance a nuestro `finally` de correr, así que el
+    work_dir del job cancelado queda huérfano en el disco del worker.
+    Esto lo barre al arrancar CADA job nuevo (no es tarea de Beat porque
+    cada worker tiene su propio filesystem local, ver docstring real)."""
+
+    def test_removes_old_dirs_but_keeps_current_job_and_recent_ones(self, task_env, tmp_path, monkeypatch):
+        import os
+        import time as time_module
+
+        work_root = tmp_path / "work_root"
+        work_root.mkdir()
+        monkeypatch.setattr(task_env.settings, "work_dir", str(work_root))
+        monkeypatch.setattr(task_env.settings, "cleanup_max_age_hours", 1)
+
+        old_dir = work_root / "old-job-huerfano"
+        old_dir.mkdir()
+        recent_dir = work_root / "recent-job"
+        recent_dir.mkdir()
+        current_dir = work_root / "current-job"
+        current_dir.mkdir()
+
+        old_ts = time_module.time() - (2 * 3600)  # 2 horas -- más viejo que el límite de 1h
+        os.utime(old_dir, (old_ts, old_ts))
+
+        task_env._cleanup_stale_workdirs("current-job")
+
+        assert not old_dir.exists(), "el directorio viejo huérfano debería haberse borrado"
+        assert recent_dir.exists(), "el directorio reciente no debería tocarse"
+        assert current_dir.exists(), "el directorio del job actual nunca se toca, aunque sea viejo"
+
+    def test_no_op_if_work_dir_does_not_exist_yet(self, task_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(task_env.settings, "work_dir", str(tmp_path / "no-existe-todavia"))
+        task_env._cleanup_stale_workdirs("cualquier-job")  # no debe explotar
+
+    def test_ignores_files_only_touches_directories(self, task_env, tmp_path, monkeypatch):
+        import os
+        import time as time_module
+
+        work_root = tmp_path / "work_root"
+        work_root.mkdir()
+        monkeypatch.setattr(task_env.settings, "work_dir", str(work_root))
+        monkeypatch.setattr(task_env.settings, "cleanup_max_age_hours", 1)
+
+        stray_file = work_root / "no-es-un-directorio.txt"
+        stray_file.write_text("x")
+        old_ts = time_module.time() - (2 * 3600)
+        os.utime(stray_file, (old_ts, old_ts))
+
+        task_env._cleanup_stale_workdirs("current-job")  # no debe explotar ni tocar el archivo
+
+        assert stray_file.exists()
+
+    def test_called_at_the_start_of_process_video(self, task_env, tmp_path, monkeypatch):
+        from app.pipeline.download import DownloadResult
+        from app.pipeline.translate import TranslatedSegment
+
+        calls = []
+        monkeypatch.setattr(task_env, "_cleanup_stale_workdirs", lambda job_id: calls.append(job_id))
+        monkeypatch.setattr(
+            task_env, "download_audio_only",
+            lambda *a, **kw: DownloadResult(path=tmp_path / "audio.mp3", title="t", duration=1.0),
+        )
+        monkeypatch.setattr(task_env, "transcribe", lambda *a, **kw: [Segment(start=0, end=1, text="hi")])
+        monkeypatch.setattr(
+            task_env, "translate",
+            lambda *a, **kw: [TranslatedSegment(start=0, end=1, text_original="hi", text="hola")],
+        )
+
+        task_env.process_video.apply(args=("job-cleanup-check", "https://example.com/v", "es", "srt")).get()
+
+        assert calls == ["job-cleanup-check"]
+
+
 class TestTaskExceptionPaths:
+
     def test_storage_error_is_not_retried(self, task_env, tmp_path, monkeypatch):
         from app.pipeline.download import DownloadResult
         from app.pipeline.translate import TranslatedSegment

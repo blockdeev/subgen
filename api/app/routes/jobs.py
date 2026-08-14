@@ -6,9 +6,15 @@ import uuid
 from celery.result import AsyncResult
 from fastapi import APIRouter, Request
 
-from app.celery_client import enqueue_job, get_async_result
+from app.celery_client import cancel_job, enqueue_job, get_async_result
 from app.config import get_settings
-from app.models import JobCreateRequest, JobCreateResponse, JobResult, JobStatusResponse
+from app.models import (
+    JobCancelResponse,
+    JobCreateRequest,
+    JobCreateResponse,
+    JobResult,
+    JobStatusResponse,
+)
 from app.rate_limit import limiter
 
 router = APIRouter(prefix="/api", tags=["jobs"])
@@ -67,9 +73,30 @@ def map_async_result(async_result: AsyncResult) -> JobStatusResponse:
     if state == "RETRY":
         return JobStatusResponse(job_id=job_id, status="retrying", progress=0.0)
 
+    if state == "REVOKED":
+        return JobStatusResponse(
+            job_id=job_id, status="cancelled", progress=0.0, message_key="status.cancelled",
+        )
+
     return JobStatusResponse(job_id=job_id, status=state.lower(), progress=0.0)
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse)
 async def get_job(job_id: str) -> JobStatusResponse:
     return map_async_result(get_async_result(job_id))
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=JobCancelResponse)
+async def cancel(job_id: str) -> JobCancelResponse:
+    previous_state = cancel_job(job_id)
+
+    if previous_state in ("SUCCESS", "FAILURE", "REVOKED"):
+        # Idempotente a propósito: cancelar algo que ya había terminado
+        # (carrera normal, no un error del cliente) no es un 409 -- solo
+        # le informamos que ya no había nada corriendo para cancelar.
+        return JobCancelResponse(
+            job_id=job_id, cancelled=False,
+            detail=f"El trabajo ya había terminado (estado: {previous_state.lower()})",
+        )
+
+    return JobCancelResponse(job_id=job_id, cancelled=True, detail=None)

@@ -153,6 +153,15 @@ header p { color: var(--text-dim); font-size: 15px; font-weight: 300; line-heigh
 .progress-percent { color: var(--accent); font-family: 'JetBrains Mono', monospace; font-weight: 500; white-space: nowrap; }
 .progress-eta { display: block; margin-top: 6px; font-size: 11px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
 
+.cancel-btn {
+  display: block; margin: 16px auto 0; padding: 8px 20px;
+  background: transparent; border: 1px solid var(--error); color: var(--error);
+  border-radius: var(--radius-sm); font-family: 'Outfit', sans-serif; font-size: 13px;
+  font-weight: 500; cursor: pointer; transition: background-color 0.15s, color 0.15s;
+}
+.cancel-btn:hover { background: var(--error); color: #fff; }
+.cancel-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ── Results ── */
 .result-area { display: none; }
 .result-area.active { display: block; }

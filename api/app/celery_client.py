@@ -58,3 +58,43 @@ def enqueue_job(job_id: str, url: str, target_lang: str, mode: str, output_fps: 
 
 def get_async_result(job_id: str) -> AsyncResult:
     return AsyncResult(job_id, app=celery_client)
+
+
+def cancel_job(job_id: str) -> str:
+    """Revoca la tarea con SIGKILL (verificado en vivo en esta misma sesión:
+    `celery_client.control.revoke(...)` con `terminate=True` mata el proceso
+    real, no solo lo marca). Devuelve el estado que tenía ANTES de cancelar
+    (para que la ruta decida si tenía sentido cancelar algo, o ya había
+    terminado por su cuenta).
+
+    OJO — límite conocido, no resuelto acá: un SIGKILL no le da chance a
+    nuestro propio código de correr su `finally` (matar el proceso de
+    FFmpeg hijo, borrar el work_dir local). El proceso de FFmpeg puede
+    quedar huérfano igual que con un timeout externo -- por eso
+    `cleanup_expired_outputs` en el worker también barre directorios
+    locales viejos, no solo el bucket S3 (ver tasks.py).
+    """
+    async_result = get_async_result(job_id)
+    previous_state = async_result.state
+
+    celery_client.control.revoke(job_id, terminate=True, signal="SIGKILL")
+
+    # Avisamos YA por Pub/Sub -- no esperamos a que el revoke se propague
+    # y el worker (si ya estaba corriendo) reporte nada, porque con
+    # SIGKILL nunca va a reportar nada.
+    try:
+        import json
+
+        import redis
+
+        redis.from_url(settings.redis_url, socket_connect_timeout=2).publish(
+            f"progress:{job_id}",
+            json.dumps({
+                "job_id": job_id, "status": "cancelled",
+                "message_key": "status.cancelled",
+            }),
+        )
+    except Exception:  # noqa: BLE001 - avisar por WS es best-effort, no bloqueante
+        pass
+
+    return str(previous_state)

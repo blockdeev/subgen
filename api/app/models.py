@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 JobMode = Literal["srt", "video"]
 JobStatus = Literal[
     "queued", "downloading", "transcribing", "translating",
-    "burning", "completed", "error", "retrying",
+    "burning", "completed", "error", "retrying", "cancelled",
 ]
 
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -51,6 +51,12 @@ class JobCreateRequest(BaseModel):
 
 class JobCreateResponse(BaseModel):
     job_id: str
+
+
+class JobCancelResponse(BaseModel):
+    job_id: str
+    cancelled: bool
+    detail: Optional[str] = None
 
 
 class PreviewSegment(BaseModel):

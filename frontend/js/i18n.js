@@ -61,6 +61,8 @@
       'error.url_required': 'Ingresá la URL del video',
 
       'progress.eta': 'faltan ~{time}',
+      'progress.cancel': 'Cancelar',
+      'status.cancelled': 'Cancelado',
 
       'result.segmentsCount': '{count} segmentos',
 
@@ -121,6 +123,8 @@
       'error.url_required': 'Enter the video URL',
 
       'progress.eta': '~{time} left',
+      'progress.cancel': 'Cancel',
+      'status.cancelled': 'Cancelled',
 
       'result.segmentsCount': '{count} segments',
 

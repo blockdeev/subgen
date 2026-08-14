@@ -199,3 +199,69 @@ class TestRateLimit:
             if last_status == 429:
                 break
         assert last_status == 429
+
+
+class TestCancelJob:
+    def test_cancel_running_job_calls_revoke_with_sigkill_and_returns_cancelled_true(self, client, monkeypatch):
+        import app.celery_client as celery_client_module
+
+        revoke_calls = []
+        monkeypatch.setattr(
+            celery_client_module.celery_client.control, "revoke",
+            lambda job_id, **kw: revoke_calls.append((job_id, kw)),
+        )
+
+        resp = client.post("/api/jobs/un-job-corriendo/cancel")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cancelled"] is True
+        assert data["job_id"] == "un-job-corriendo"
+        assert len(revoke_calls) == 1
+        called_job_id, called_kwargs = revoke_calls[0]
+        assert called_job_id == "un-job-corriendo"
+        assert called_kwargs["terminate"] is True
+        assert called_kwargs["signal"] == "SIGKILL"
+
+    def test_cancel_already_completed_job_returns_cancelled_false(self, client, stub_task_result, monkeypatch):
+        import app.celery_client as celery_client_module
+
+        monkeypatch.setattr(celery_client_module.celery_client.control, "revoke", lambda *a, **kw: None)
+
+        job_id = client.post(
+            "/api/jobs", json={"url": "https://youtube.com/watch?v=abc123"}
+        ).json()["job_id"]
+
+        resp = client.post(f"/api/jobs/{job_id}/cancel")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cancelled"] is False
+        assert "ya había terminado" in data["detail"]
+
+    def test_cancel_never_raises_even_if_redis_publish_fails(self, client, monkeypatch):
+        # Sin Redis real en el test, el publish del evento 'cancelled'
+        # falla en silencio (try/except a propósito, ver celery_client.py)
+        # -- confirma que eso no tumba el endpoint.
+        import app.celery_client as celery_client_module
+
+        monkeypatch.setattr(celery_client_module.celery_client.control, "revoke", lambda *a, **kw: None)
+        resp = client.post("/api/jobs/otro-job/cancel")
+        assert resp.status_code == 200
+
+
+class TestMapAsyncResultRevoked:
+    def test_revoked_state_maps_to_cancelled_status(self):
+        from unittest.mock import MagicMock
+
+        from app.routes.jobs import map_async_result
+
+        fake_result = MagicMock()
+        fake_result.state = "REVOKED"
+        fake_result.id = "job123"
+
+        response = map_async_result(fake_result)
+
+        assert response.status == "cancelled"
+        assert response.message_key == "status.cancelled"
+        assert response.job_id == "job123"

@@ -86,6 +86,11 @@
       showError(message);
       $('progressArea').classList.remove('active');
       resetBtns();
+    } else if (payload.status === 'cancelled') {
+      stopUpdates();
+      showError(message);
+      $('progressArea').classList.remove('active');
+      resetBtns();
     }
   }
 
@@ -116,7 +121,7 @@
     ws.addEventListener('close', () => {
       clearTimeout(connectTimeout);
       // Si el job todavía no terminó y el socket se cayó, caemos a polling.
-      if (currentJobId === jobId && !pollInterval && lastPayload && !['completed', 'error'].includes(lastPayload.status)) {
+      if (currentJobId === jobId && !pollInterval && lastPayload && !['completed', 'error', 'cancelled'].includes(lastPayload.status)) {
         startPolling(jobId);
       }
     });
@@ -143,6 +148,21 @@
     if (ws) { ws.close(); ws = null; }
   }
 
+  async function cancelCurrentJob() {
+    if (!currentJobId) return;
+    const btn = $('cancelBtn');
+    btn.disabled = true;
+    try {
+      await fetch(`${apiBase()}/api/jobs/${currentJobId}/cancel`, { method: 'POST' });
+      // No renderizamos nada acá a mano -- el propio backend publica el
+      // evento 'cancelled' por el mismo canal de WebSocket/polling que ya
+      // estamos escuchando, así que renderPayload() lo agarra solo.
+    } catch (err) {
+      showError(t('error.connection'));
+      btn.disabled = false;
+    }
+  }
+
   async function startProcess(mode) {
     const url = $('urlInput').value.trim();
     const lang = $('langSelect').value;
@@ -153,6 +173,7 @@
     lastPayload = null;
 
     document.querySelectorAll('.action-btn').forEach((b) => (b.disabled = true));
+    $('cancelBtn').disabled = false;
 
     buildPipeline(mode);
     $('progressArea').classList.add('active');
@@ -250,6 +271,7 @@
   });
 
   $('urlInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') startProcess('srt'); });
+  $('cancelBtn').addEventListener('click', cancelCurrentJob);
 
   window.addEventListener('subgen:langchange', () => {
     if (lastPayload) renderPayload(lastPayload);

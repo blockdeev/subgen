@@ -100,6 +100,34 @@ def _stage_timer(job_id: str, stage: str) -> Iterator[None]:
         logger.info("Job %s: etapa '%s' tomó %.1fs", job_id, stage, time.monotonic() - t0)
 
 
+def _cleanup_stale_workdirs(current_job_id: str) -> None:
+    """Barre directorios de jobs viejos huérfanos en ESTE worker, antes de
+    arrancar uno nuevo.
+
+    Pasa cuando un job se cancela con SIGKILL (revoke --terminate) o el
+    proceso muere por cualquier otro motivo externo -- nuestro propio
+    `finally` (que borraría el work_dir en una salida normal) nunca llega
+    a correr. Cada worker tiene su PROPIO filesystem local (no hay volumen
+    compartido para `work_dir`, ver README), así que esto se hace acá, en
+    cada ejecución de tarea, en vez de como tarea periódica de Beat --
+    Beat solo corre embebido en worker-1, y no alcanzaría el disco de los
+    demás workers.
+    """
+    base = Path(settings.work_dir)
+    if not base.is_dir():
+        return
+    threshold = time.time() - (settings.cleanup_max_age_hours * 3600)
+    for entry in base.iterdir():
+        if not entry.is_dir() or entry.name == current_job_id:
+            continue
+        try:
+            if entry.stat().st_mtime < threshold:
+                shutil.rmtree(entry, ignore_errors=True)
+                logger.info("Limpieza: borrado work_dir huérfano %s", entry.name)
+        except OSError:
+            continue
+
+
 def _publish_terminal(job_id: str, status: str, **extra: Any) -> None:
     payload = {"job_id": job_id, "status": status, **extra}
     _publisher.publish(job_id, payload)
@@ -121,6 +149,7 @@ def process_video(
     """mode="srt" → solo subtítulos. mode="video" → subtítulos + video quemado."""
     job_id_var.set(job_id)  # correlación en los logs JSON de este proceso worker
     on_progress = _make_on_progress(self, job_id, mode)
+    _cleanup_stale_workdirs(job_id)
     work_dir = Path(settings.work_dir) / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
     effective_fps = output_fps if output_fps > 0 else settings.default_burn_fps
