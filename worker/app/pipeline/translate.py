@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -45,6 +46,22 @@ class TranslatedSegment:
 
 
 def _looks_like_rate_limit(exc: Exception) -> bool:
+    # deep-translator tira TranslationNotFound cuando Google throttlea bajo
+    # carga concurrente -- devuelve "no encontré traducción" en vez de un
+    # 429 explícito (verificado en vivo: bajo 4 peticiones en paralelo,
+    # ~1 de cada 12 falla así; la MISMA frase en secuencial traduce bien).
+    # Lo tratamos como reintentable. El riesgo teórico es una frase
+    # genuinamente intraducible que reintentaríamos 3 veces al pedo, pero
+    # eso solo cuesta unos segundos de backoff antes de caer al fallback
+    # ítem-por-ítem que ya existía -- barato comparado con perder la
+    # traducción de un lote entero.
+    try:
+        from deep_translator.exceptions import TranslationNotFound
+
+        if isinstance(exc, TranslationNotFound):
+            return True
+    except ImportError:
+        pass
     msg = str(exc).lower()
     return any(marker in msg for marker in _RATE_LIMIT_MARKERS)
 
@@ -72,16 +89,32 @@ def _translate_batch_with_fallback(
                 )
                 time.sleep(backoff)
                 continue
-            logger.warning("Fallo el lote de traducción %s, reintentando ítem por ítem", batch_label)
+            logger.warning(
+                "Fallo el lote de traducción %s (%s: %s), reintentando ítem por ítem",
+                batch_label, type(exc).__name__, str(exc)[:200],
+            )
             results: list[str] = []
             for t in texts:
-                try:
-                    results.append(translator.translate(t))
-                except Exception:
-                    results.append(t)  # degradación intencional: se conserva el original
+                results.append(_translate_one_with_retry(translator, t))
             return results
 
     return texts  # inalcanzable en la práctica, deja el type checker conforme
+
+
+def _translate_one_with_retry(translator: Any, text: str) -> str:
+    """Traduce un ítem suelto, reintentando con backoff si Google throttlea
+    (mismo criterio que el lote). Si agota los reintentos o falla por otra
+    causa, conserva el original -- degradación intencional, mejor el texto
+    en inglés que perderlo, pero solo DESPUÉS de intentar de verdad."""
+    for attempt in range(_MAX_BATCH_RETRIES + 1):
+        try:
+            return str(translator.translate(text))
+        except Exception as exc:  # noqa: BLE001
+            if _looks_like_rate_limit(exc) and attempt < _MAX_BATCH_RETRIES:
+                time.sleep(min(2.0 ** attempt, _BACKOFF_CAP_SECONDS))
+                continue
+            return text  # se conserva el original tras agotar reintentos
+    return text  # inalcanzable, el for siempre retorna arriba -- para el type checker
 
 
 def translate(
@@ -89,7 +122,12 @@ def translate(
     *,
     target_lang: str = "es",
     batch_size: int = 25,
-    max_concurrency: int = 4,
+    # 2 y no 4: con 4 lotes concurrentes, Google throttlea y devuelve
+    # TranslationNotFound a ~1 de cada 12 peticiones (verificado en vivo).
+    # Con 2 el throttling casi no aparece, y el backoff por ítem cubre los
+    # casos residuales. Sigue siendo mucho más rápido que secuencial
+    # (185s -> ~30-40s medido) sin romper la traducción.
+    max_concurrency: int = 2,
     on_progress: ProgressCallback = noop_progress,
 ) -> list[TranslatedSegment]:
     on_progress(StageProgress(stage="translating", stage_pct=0.0, message_key="status.translating"))

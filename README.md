@@ -42,6 +42,7 @@ para el porque.
 - [Variables de entorno](#variables-de-entorno)
 - [Cookies de YouTube](#cookies-de-youtube)
 - [Despliegue distribuido](DEPLOYMENT.md)
+- [Quemado distribuido por segmentos (diseño, pendiente de datos de producción)](ARCHITECTURE.md)
 - [Correr los tests](#correr-los-tests)
 - [Decisiones de arquitectura](#decisiones-de-arquitectura)
 - [Seguridad](#seguridad)

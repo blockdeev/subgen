@@ -25,12 +25,16 @@
   function applyTheme(theme) {
     document.documentElement.dataset.theme = theme;
     const btn = document.getElementById('themeToggleBtn');
-    if (btn && window.SubGenI18n) {
-      const key = theme === 'dark' ? 'theme.toggleLabelToLight' : 'theme.toggleLabelToDark';
+    if (btn) {
       const glyph = btn.querySelector('.icon-btn-glyph');
-      const label = btn.querySelector('.icon-btn-label');
-      if (glyph) glyph.textContent = theme === 'dark' ? '🌙' : '☀️';
-      if (label) label.textContent = window.SubGenI18n.t(key);
+      // El ícono muestra la ACCIÓN disponible, no el estado actual: en
+      // oscuro se ofrece pasar a claro (sol), en claro se ofrece pasar a
+      // oscuro (luna).
+      if (glyph) glyph.textContent = theme === 'dark' ? '☀️' : '🌙';
+      if (window.SubGenI18n) {
+        const key = theme === 'dark' ? 'theme.toggleLabelToLight' : 'theme.toggleLabelToDark';
+        btn.setAttribute('aria-label', window.SubGenI18n.t(key));
+      }
     }
   }
 

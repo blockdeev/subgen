@@ -4,6 +4,7 @@ mockeado: yt-dlp, deep-translator, ffmpeg, S3, Redis). Correr desde
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+import os
 import subprocess
 import tempfile
 
@@ -286,6 +287,67 @@ class TestTranslate:
         assert result[0].text == "item-hi"
         # 1 intento inicial + 3 reintentos = 4 llamadas a translate_batch antes de rendirse
         assert fake_translator.translate_batch.call_count == 4
+
+    def test_translation_not_found_is_treated_as_retryable(self, monkeypatch):
+        """El bug real que encontramos en vivo: bajo concurrencia, Google
+        tira TranslationNotFound (no un 429), y antes eso NO se reconocía
+        como rate-limit -- caía directo al inglés. Ahora se detecta por
+        TIPO de excepción y se reintenta."""
+        import app.pipeline.translate as translate_module
+        from deep_translator.exceptions import TranslationNotFound
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        # Primer intento del lote: TranslationNotFound. Segundo: bien.
+        fake_translator.translate_batch.side_effect = [
+            TranslationNotFound("frase --> No translation was found"),
+            ["traducido ok"],
+        ]
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hi")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "traducido ok", "TranslationNotFound debería reintentarse, no caer al inglés"
+        assert fake_translator.translate_batch.call_count == 2
+
+    def test_item_level_fallback_retries_each_item_not_just_gives_up(self, monkeypatch):
+        """El segundo bug: cuando el lote cae al fallback ítem-por-ítem, ese
+        fallback antes NO reintentaba -- un ítem que throttleaba quedaba en
+        inglés aunque un reintento lo hubiera traducido. Ahora reintenta."""
+        import app.pipeline.translate as translate_module
+        from deep_translator.exceptions import TranslationNotFound
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        # El lote entero falla siempre -> cae al fallback ítem por ítem.
+        fake_translator.translate_batch.side_effect = TranslationNotFound("x")
+        # En el fallback, el ítem falla las primeras 2 veces y a la 3ra anda.
+        fake_translator.translate.side_effect = [
+            TranslationNotFound("x"),
+            TranslationNotFound("x"),
+            "item traducido",
+        ]
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hi")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "item traducido", "el ítem debería reintentarse en el fallback, no quedar en inglés"
+        assert fake_translator.translate.call_count == 3
+
+    def test_item_level_fallback_preserves_original_after_exhausting_retries(self, monkeypatch):
+        import app.pipeline.translate as translate_module
+        from deep_translator.exceptions import TranslationNotFound
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.side_effect = TranslationNotFound("x")
+        fake_translator.translate.side_effect = TranslationNotFound("x")  # falla siempre
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="texto original")], target_lang="es", batch_size=25)
+
+        # Tras agotar todos los reintentos, conserva el original (degradación intencional)
+        assert result[0].text == "texto original"
 
 
 # ── burn: el estilo quemado tiene que ser EXACTAMENTE el validado ─────────
@@ -1050,3 +1112,133 @@ class TestTransientRetryExhaustion:
         assert job_id == "job10"
         assert payload["status"] == "error"
         assert "boom" in payload["message_params"]["detail"]
+
+
+class TestCpuThreadsAndBatchedInference:
+    """Verificado contra la API real de faster-whisper instalada
+    (inspeccioné WhisperModel.__init__ y BatchedInferencePipeline.transcribe
+    con inspect.signature antes de escribir esto) -- pero sin poder cargar
+    un modelo real acá (huggingface.co no está en la allowlist de red de
+    este sandbox), así que todo esto usa mocks. La comparación real de
+    calidad/timestamps entre secuencial y batched queda pendiente de
+    correr en hardware real, ver README."""
+
+    def setup_method(self):
+        import app.pipeline.transcribe as transcribe_module
+        transcribe_module._model = None
+        transcribe_module._batched_pipeline = None
+
+    def teardown_method(self):
+        import app.pipeline.transcribe as transcribe_module
+        transcribe_module._model = None
+        transcribe_module._batched_pipeline = None
+
+    def test_resolve_cpu_threads_uses_configured_value_when_positive(self):
+        from app.pipeline.transcribe import resolve_cpu_threads
+        assert resolve_cpu_threads(8) == 8
+
+    def test_resolve_cpu_threads_falls_back_to_available_cores_when_zero(self):
+        from app.pipeline.transcribe import resolve_cpu_threads
+        result = resolve_cpu_threads(0)
+        assert result > 0
+        assert result == len(os.sched_getaffinity(0))
+
+    def test_whisper_model_constructed_with_resolved_cpu_threads(self, monkeypatch):
+        import app.pipeline.transcribe as transcribe_module
+
+        captured = {}
+
+        class FakeWhisperModel:
+            def __init__(self, model_name, device, compute_type, cpu_threads):
+                captured["cpu_threads"] = cpu_threads
+
+        monkeypatch.setattr(
+            "faster_whisper.WhisperModel", FakeWhisperModel,
+        )
+        transcribe_module.get_whisper_model("small", "cpu", "int8", cpu_threads=6)
+        assert captured["cpu_threads"] == 6
+
+    def test_sequential_path_forces_without_timestamps_false(self, monkeypatch, tmp_path):
+        import app.pipeline.transcribe as transcribe_module
+
+        captured = {}
+
+        class FakeModel:
+            def transcribe(self, path, **kwargs):
+                captured.update(kwargs)
+                return [], SimpleNamespace(language="en")
+
+        transcribe_module._model = FakeModel()
+
+        transcribe_module.transcribe(
+            tmp_path / "audio.mp3", model_name="small", device="cpu", compute_type="int8",
+            use_batched=False,
+        )
+        assert captured["without_timestamps"] is False
+
+    def test_batched_path_forces_without_timestamps_false_and_passes_batch_size(self, monkeypatch, tmp_path):
+        """El caso que importa de verdad: BatchedInferencePipeline.transcribe
+        tiene without_timestamps=True por DEFAULT en la librería -- si esto
+        no lo pisara explícito, se rompería el pipeline entero en silencio."""
+        import app.pipeline.transcribe as transcribe_module
+
+        captured = {}
+
+        class FakeBatchedPipeline:
+            def transcribe(self, path, **kwargs):
+                captured.update(kwargs)
+                return [], SimpleNamespace(language="en")
+
+        transcribe_module._batched_pipeline = FakeBatchedPipeline()
+
+        transcribe_module.transcribe(
+            tmp_path / "audio.mp3", model_name="small", device="cpu", compute_type="int8",
+            use_batched=True, batch_size=16,
+        )
+        assert captured["without_timestamps"] is False
+        assert captured["batch_size"] == 16
+
+    def test_batched_pipeline_reuses_the_same_model_singleton_not_double_loaded(self, monkeypatch):
+        import app.pipeline.transcribe as transcribe_module
+
+        load_count = {"n": 0}
+
+        class FakeWhisperModel:
+            def __init__(self, *a, **kw):
+                load_count["n"] += 1
+
+        class FakeBatchedInferencePipeline:
+            def __init__(self, model):
+                self.model = model
+
+        monkeypatch.setattr("faster_whisper.WhisperModel", FakeWhisperModel)
+        monkeypatch.setattr("faster_whisper.BatchedInferencePipeline", FakeBatchedInferencePipeline)
+
+        transcribe_module.get_batched_pipeline("small", "cpu", "int8")
+
+        assert load_count["n"] == 1, "el modelo se cargó más de una vez"
+
+    def test_non_batched_mode_never_touches_batched_pipeline(self, tmp_path):
+        """Con use_batched=False (el default), get_batched_pipeline no
+        debería ni llamarse -- no tiene sentido armar el pipeline batched
+        si no se va a usar."""
+        import app.pipeline.transcribe as transcribe_module
+
+        class FakeModel:
+            def transcribe(self, path, **kwargs):
+                return [], SimpleNamespace(language="en")
+
+        transcribe_module._model = FakeModel()
+
+        def fail_if_called(*a, **kw):
+            raise AssertionError("get_batched_pipeline no debería llamarse con use_batched=False")
+
+        transcribe_module.get_batched_pipeline = fail_if_called  # type: ignore[assignment]
+        try:
+            transcribe_module.transcribe(
+                tmp_path / "audio.mp3", model_name="small", device="cpu", compute_type="int8",
+                use_batched=False,
+            )
+        finally:
+            import importlib
+            importlib.reload(transcribe_module)

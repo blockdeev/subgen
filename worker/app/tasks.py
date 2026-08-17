@@ -189,6 +189,9 @@ def process_video(
                 vad_min_silence_ms=settings.whisper_vad_min_silence_ms,
                 vad_speech_pad_ms=settings.whisper_vad_speech_pad_ms,
                 audio_duration_seconds=duration,
+                cpu_threads=settings.whisper_cpu_threads,
+                use_batched=settings.whisper_use_batched,
+                batch_size=settings.whisper_batch_size,
                 on_progress=on_progress,
             )
         if not segments:

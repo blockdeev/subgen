@@ -16,8 +16,8 @@
     es: {
       'header.tagline': 'Pegá la URL de un video en inglés y elegí qué querés obtener.',
       'lang.toggleLabel': 'EN',
-      'theme.toggleLabelToDark': 'Oscuro',
-      'theme.toggleLabelToLight': 'Claro',
+      'theme.toggleLabelToDark': 'Cambiar a tema oscuro',
+      'theme.toggleLabelToLight': 'Cambiar a tema claro',
 
       'card.urlTitle': 'URL del video',
       'url.placeholder': 'https://www.youtube.com/watch?v=...',
@@ -78,8 +78,8 @@
     en: {
       'header.tagline': 'Paste the URL of an English video and pick what you want to get.',
       'lang.toggleLabel': 'ES',
-      'theme.toggleLabelToDark': 'Dark',
-      'theme.toggleLabelToLight': 'Light',
+      'theme.toggleLabelToDark': 'Switch to dark theme',
+      'theme.toggleLabelToLight': 'Switch to light theme',
 
       'card.urlTitle': 'Video URL',
       'url.placeholder': 'https://www.youtube.com/watch?v=...',

@@ -25,6 +25,19 @@ class WorkerSettings(BaseSettings):
     whisper_device: Literal["cpu", "cuda", "auto"] = Field(default="cpu")
     whisper_compute_type: str = Field(default="int8")
     whisper_beam_size: int = Field(default=5)
+    # cpu_threads=0 (el default de faster-whisper) NO garantiza usar todos
+    # los cores disponibles -- ctranslate2 lee OMP_NUM_THREADS si está
+    # seteada, y si no, cae al default del runtime de OpenMP, que varía
+    # (documentado como fuente de confusión real en la comunidad). 0 acá
+    # significa "detectar cores disponibles" (os.cpu_count()), no "dejarlo
+    # en manos de OpenMP".
+    whisper_cpu_threads: int = Field(default=0)
+    # BatchedInferencePipeline (faster-whisper >=1.0): procesa chunks en
+    # paralelo en vez de secuencial. Detrás de un flag, default OFF --
+    # sin verificar en hardware real que no degrada timestamps/calidad
+    # (ver README, nota de esta feature).
+    whisper_use_batched: bool = Field(default=False)
+    whisper_batch_size: int = Field(default=8)
     whisper_vad_min_silence_ms: int = Field(default=500)
     whisper_vad_speech_pad_ms: int = Field(default=200)
 
@@ -34,7 +47,7 @@ class WorkerSettings(BaseSettings):
     # pura latencia de red esperando uno por uno. 4-6 es razonable sin
     # gatillar rate-limiting agresivo de Google; cada lote individual ya
     # tiene su propio backoff si lo pega igual (ver translate.py).
-    translate_concurrency: int = Field(default=4)
+    translate_concurrency: int = Field(default=2)
 
     # Límites de negocio
     max_video_duration_seconds: int = Field(default=3600, description="0 = sin límite")
