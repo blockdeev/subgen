@@ -209,7 +209,9 @@ clara sin ninguna duda -- ahí el patrón de carga (ráfagas cortas de I/O,
 no cómputo sostenido) es exactamente el que un vCPU compartido maneja
 bien.
 
-## Cómo desplegar
+## Cómo desplegar -- checklist ejecutable de punta a punta
+
+Asume que arrancás de cero, con las VPS recién creadas y nada más.
 
 ### 1. Elegí el tamaño de cada VPS
 
@@ -221,12 +223,19 @@ bien.
   opción con mejor relación costo/cores hoy**. Si no lo mediste todavía
   o el resultado no fue bueno, **CPX31 o CPX41** como segunda opción --
   y medí en producción real (ver más abajo) antes de pagar el 2x de CCX.
+  Con 1-2 workers de presupuesto, priorizá **cores sobre cantidad de
+  VPS**: un solo worker con más cores procesa un job individual más
+  rápido; dos workers más chicos dan más throughput (jobs concurrentes)
+  pero cada uno sigue siendo tan lento como sus propios cores. Si el uso
+  real es "un usuario a la vez, quiero que sea rápido", priorizá cores
+  en un solo worker. Si es "varios usuarios en simultáneo", priorizá
+  cantidad.
 
 ### 2. Red privada
 
-Igual que antes: **Networks → Create Network** en el panel de Hetzner
-Cloud, agregá todas las VPS (la combinada y todas las de worker) a esa
-red. Anotá las IPs privadas de cada una.
+**Networks → Create Network** en el panel de Hetzner Cloud, agregá todas
+las VPS (la combinada y todas las de worker) a esa red. Anotá las IPs
+privadas de cada una.
 
 ### 3. Instalar Docker en todas
 
@@ -234,22 +243,201 @@ red. Anotá las IPs privadas de cada una.
 curl -fsSL https://get.docker.com | sh
 ```
 
-### 4. Copiar el repo a todas
+### 4. Firewall -- ANTES de levantar ningún contenedor
+
+Regla de oro de este proyecto: **Redis y MinIO nunca expuestos a
+internet, solo a la red privada.** Sin esto, cualquiera con la IP
+pública de tu VPS combinada puede leer/escribir tu Redis (sin
+contraseña, ver nota de Secrets abajo) o listar tu bucket de S3.
+
+En **cada VPS** (`ufw` viene preinstalado en las imágenes estándar de
+Ubuntu de Hetzner; ajustá si usás otra distro):
+
+```bash
+# Default: negar todo entrante, permitir todo saliente
+ufw default deny incoming
+ufw default allow outgoing
+
+# SSH -- siempre, o te quedás afuera de la VPS
+ufw allow 22/tcp
+```
+
+**En la VPS combinada, además:**
+
+```bash
+# API: pública (80/443, el frontend y las requests de los usuarios)
+ufw allow 80/tcp
+ufw allow 443/tcp
+
+# Redis: SOLO desde la red privada de Hetzner, nunca 0.0.0.0
+ufw allow from 10.0.0.0/8 to any port 6379 proto tcp
+
+# MinIO S3 API (9000): necesita ALCANCE PÚBLICO igual -- el navegador del
+# usuario baja el archivo final directo desde ahí vía URL pre-firmada, no
+# a través de la API. Si te incomoda exponerlo, la alternativa es usar
+# Hetzner Object Storage / S3 real en vez de autohostear MinIO (evita
+# este problema del todo, ver .env.example).
+ufw allow 9000/tcp
+
+# Consola de administración de MinIO (9001): NUNCA pública, ni siquiera
+# hace falta en producción salvo que quieras administrarla a mano.
+ufw allow from 10.0.0.0/8 to any port 9001 proto tcp
+```
+
+**En cada VPS de worker**: no hace falta abrir NADA más allá de SSH --
+los workers solo hacen conexiones salientes (a Redis, a MinIO, a
+YouTube, a Google Translate), nunca reciben conexiones entrantes de
+nadie.
+
+Activar al final, en cada VPS:
+
+```bash
+ufw enable
+ufw status verbose   # confirmar que quedó como esperabas ANTES de seguir
+```
+
+(ajustá `10.0.0.0/8` al rango real de tu red privada de Hetzner -- confirmalo
+en el panel, Networks → tu red → no asumas el rango)
+
+### 5. Copiar el repo a todas
 
 ```bash
 git clone <tu-repo> subgen && cd subgen
 ```
 
-### 5. Configurar el `.env` de cada VPS
+### 6. Secrets -- nunca los defaults del repo en producción
+
+`.env.example` trae credenciales de juguete (`SUBGEN_S3_ACCESS_KEY=subgen`,
+`SUBGEN_S3_SECRET_KEY=subgen12345`, mismo para `MINIO_ROOT_USER`/
+`MINIO_ROOT_PASSWORD`) -- están ahí para que el entorno local funcione
+sin fricción, **nunca para producción**. Generá credenciales reales:
+
+```bash
+# access key y secret key para MinIO/S3 -- generá algo random, no un
+# password memorable
+openssl rand -hex 16   # para SUBGEN_S3_ACCESS_KEY
+openssl rand -hex 32   # para SUBGEN_S3_SECRET_KEY (y MINIO_ROOT_PASSWORD, el mismo valor)
+```
+
+Redis no tiene contraseña configurada -- su seguridad depende
+**enteramente** de que el firewall del paso 4 esté bien puesto (nunca
+expuesto a `0.0.0.0`). Si querés una capa extra de defensa, se le puede
+agregar `requirepass` a la imagen de Redis, pero no es parte del setup
+por default de este proyecto -- si te importa, avisame y lo agregamos
+antes de desplegar, no después.
+
+### 7. Cookies de YouTube -- probable primer bloqueante real
+
+Desde una IP de datacenter, YouTube bloquea sesiones sin cookies mucho
+más agresivo que desde una IP residencial. Es muy probable que el primer
+job real desde el VPS falle sin esto -- hacelo ANTES de mandar nada.
+
+**Exportar** (elegí una, con una sesión de YouTube logueada):
+
+- Extensión de navegador "Get cookies.txt LOCALLY" (Chrome/Firefox): entrá
+  a youtube.com logueado, exportá en formato Netscape.
+- O con `yt-dlp` instalado en tu máquina local (no en el contenedor):
+  ```bash
+  yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download "https://youtube.com/watch?v=dQw4w9WgXcQ"
+  ```
+
+**Subir al VPS de worker** (cada VPS de worker necesita su propia copia):
+
+```bash
+scp cookies.txt usuario@ip-del-worker:/home/usuario/subgen/cookies.txt
+```
+
+**Configurar** en el `.env` de cada VPS de worker:
+
+```
+YTDLP_COOKIES_FILE_HOST=/home/usuario/subgen/cookies.txt
+```
+
+**Verificar ANTES de mandar el primer job real** -- dos chequeos, uno
+rápido (el archivo tiene contenido válido) y uno real (yt-dlp lo usa de
+verdad contra YouTube):
+
+```bash
+# 1. El archivo tiene cookies de youtube.com de verdad (no vacío, no corrupto)
+docker exec subgen-worker-1-1 python3 -c "
+import http.cookiejar
+jar = http.cookiejar.MozillaCookieJar('/worker/cookies.txt')
+jar.load(ignore_discard=True, ignore_expires=True)
+yt = [c for c in jar if 'youtube.com' in c.domain]
+print(f'{len(yt)} cookies de youtube.com cargadas')
+assert len(yt) > 0, 'el archivo no tiene cookies de youtube.com -- revisar la exportación'
+"
+
+# 2. Prueba real contra YouTube, sin descargar nada (rápido)
+docker exec subgen-worker-1-1 yt-dlp --cookies /worker/cookies.txt \
+  --skip-download --simulate "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+Si el paso 2 imprime el título del video y metadata sin errores, las
+cookies funcionan. Repetí en `worker-2`/`worker-3` (cada worker tiene su
+propio archivo, verificalos todos).
+
+**Cómo reconocer cookies vencidas más adelante**: el error que vas a ver
+(en el detalle del job fallido, o en `docker compose logs worker-N`) va a
+mencionar **"sign in"** en el mensaje y, si viene de yt-dlp con cookies ya
+configuradas, suele incluir la frase **"exporting YouTube cookies"** en el
+hint que agrega la propia librería (el texto exacto de YouTube varía, esa
+parte de yt-dlp es estable). Si ves eso, repetí la exportación -- las
+cookies de sesión no duran para siempre.
+
+```bash
+docker compose logs worker-1 worker-2 | grep -iE "sign in|exporting.*cookies"
+```
+
+### 8. Configurar el resto del `.env` de cada VPS
 
 - **VPS combinada**: `SUBGEN_REDIS_URL=redis://redis:6379/0` (resuelve
   por nombre de servicio dentro de la misma VPS, no hace falta IP).
   `SUBGEN_S3_PUBLIC_ENDPOINT_URL` con la URL que va a usar el navegador
-  del usuario. `SUBGEN_CORS_ORIGINS` con tu dominio público.
+  del usuario. `SUBGEN_CORS_ORIGINS` con tu dominio público. Las
+  credenciales del paso 6, no las de `.env.example`.
 - **VPS de worker**: `SUBGEN_REDIS_URL=redis://<IP-PRIVADA-DE-LA-VPS-COMBINADA>:6379/0`.
-  Mismas `SUBGEN_S3_*` que la combinada (mismo bucket).
+  Mismas `SUBGEN_S3_*` que la combinada (mismo bucket). Cookies del paso 7.
 
-### 6. Orden de arranque
+### 9. TLS con Caddy -- para el dominio público
+
+Caddy hace TLS automático (Let's Encrypt) sin configuración manual de
+certificados. En la VPS combinada, corré Caddy delante de la API en vez
+de exponer el puerto 8000/80 directo:
+
+```bash
+# Instalar Caddy (Ubuntu/Debian):
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install caddy
+```
+
+`/etc/caddy/Caddyfile`:
+
+```
+tu-dominio.com {
+    reverse_proxy localhost:8000
+}
+```
+
+Reiniciar Caddy (`sudo systemctl restart caddy`) y listo -- HTTPS
+automático, certificado renovado solo. Con esto activo, en
+`docker-compose.prod.yml` el puerto de `api` puede quedar bindeado solo a
+`127.0.0.1:8000:8000` en vez de `80:8000` público directo (Caddy es el
+único que necesita alcanzarlo, y ya corre en la misma máquina).
+
+Actualizá `ufw` para reflejar el cambio: cerrá el 80/8000 directo, dejá
+solo 443 (y 80 si querés que Caddy redirija http→https automático, que
+es su comportamiento por default):
+
+```bash
+ufw delete allow 80/tcp    # si lo habías abierto en el paso 4
+ufw allow 80/tcp           # Caddy lo usa para el challenge de Let's Encrypt y el redirect
+ufw allow 443/tcp
+```
+
+### 10. Orden de arranque
 
 ```bash
 # VPS combinada primero:
@@ -265,53 +453,109 @@ docker compose -f docker-compose.prod.yml up -d worker-3
 # si tu presupuesto da para más VPS de worker
 ```
 
-### 7. Verificar
+### 11. Verificación post-deploy -- confirmar que todo se habla ANTES del primer job real
+
+No asumas que porque los contenedores están "Up" están bien conectados
+entre sí -- confirmá cada pieza:
 
 ```bash
-curl http://<ip-pública-vps-combinada>/api/health
+# 1. Los 5 healthy, no solo "running"
+docker compose -f docker-compose.prod.yml ps
+
+# 2. La API responde (desde afuera, con TLS si ya configuraste Caddy)
+curl https://tu-dominio.com/api/health
+# esperá algo como {"status": "ok", ...} -- si dice "degraded", Redis no
+# está alcanzable desde la API, revisar el paso 4 (firewall) o la IP
+# privada del paso 8
+
+# 3. Cada worker puede hablar con Redis (el broker de Celery)
+docker exec subgen-worker-1-1 celery -A app.celery_app inspect ping
+# tiene que responder "pong" -- si se cuelga o da timeout, Redis no es
+# alcanzable desde ESE worker puntual (firewall o IP privada mal puesta)
+
+# 4. Cookies de YouTube (paso 7, si todavía no lo hiciste)
+
+# 5. Recién ahí: un job real de prueba, corto, para confirmar el pipeline
+#    completo de punta a punta antes de anunciar nada públicamente
 ```
 
-Y de ahí, el [checklist de verificación manual](README.md#checklist-de-verificación-manual)
-completo del README.
+### 12. Qué mirar en los logs las primeras horas
+
+```bash
+docker compose -f docker-compose.prod.yml logs -f worker-1 worker-2 api
+```
+
+Prestá atención puntual a:
+
+- **`etapa 'download'` con tiempos mucho más largos que en tu máquina de
+  desarrollo** -- puede ser ancho de banda del datacenter (raro, suelen
+  tener mejor conectividad que una casa) o throttling de YouTube pese a
+  las cookies (paso 7).
+- **`Fallo el lote de traducción`** -- si aparece más seguido que en
+  desarrollo, la IP del datacenter puede estar gatillando el throttling
+  de Google Translate con más facilidad que tu IP residencial. El
+  backoff ya está para cubrir esto, pero si se repite mucho, considerá
+  bajar `SUBGEN_TRANSLATE_CONCURRENCY` de 2 a 1.
+- **CPU sostenido alto en un worker sin ningún job activo en la UI** --
+  ver "Problemas conocidos" en `ARCHITECTURE.md`. La mitigación
+  (`SUBGEN_CELERY_MAX_TASKS_PER_CHILD=1`) ya viene activada por default,
+  pero confirmá con `docker stats` que no vuelve a pasar.
+- **Espacio en disco** -- `df -h` en cada worker, sobre todo después de
+  varios jobs. Ver la sección de limpieza en `ARCHITECTURE.md`.
 
 ## Medir en producción, apenas esté arriba
 
 Todas las decisiones de rendimiento de este proyecto (códec, fps de
-salida, preset/crf, traducción concurrente, y ahora CCX vs CPX) están
-basadas en mediciones sobre **una máquina de desarrollo de 32 cores**, no
-en el hardware real de producción. El burn distribuido quedó
-explícitamente pendiente de este dato (ver `ARCHITECTURE.md`) -- pero en
-rigor, **todas** las proyecciones de esta sección de deploy también.
+salida, preset/crf, traducción concurrente, y CCX vs CPX) están basadas
+en mediciones sobre **una máquina de desarrollo de 32 cores**, no en el
+hardware real de producción. El burn distribuido, el batched de Whisper,
+y la causa raíz de los threads huérfanos quedaron explícitamente
+pendientes de este dato (ver `ARCHITECTURE.md`) -- pero en rigor,
+**todas** las proyecciones de esta sección de deploy también.
 
-Apenas tengas la VPS de worker arriba, corré un video real de ~1 hora
-(no el de 34 minutos que usamos en desarrollo -- más largo, para que
-cualquier variación se note más) y capturá el desglose por etapa:
+### Procedimiento
 
-```bash
-docker compose logs worker-1 worker-2 | grep -E "received|succeeded|etapa"
-```
+1. Conseguí un video real de **~1 hora** (no el de 34 minutos de
+   desarrollo -- más largo, para que cualquier variación se note más).
+2. Mandalo en modo video, 30fps (el default).
+3. Capturá el desglose completo apenas termine:
+   ```bash
+   docker compose -f docker-compose.prod.yml logs worker-1 worker-2 worker-3 \
+     2>/dev/null | grep -E "received|succeeded|etapa"
+   ```
+   (ajustá los nombres de worker a los que tengas realmente desplegados)
+4. Completá la tabla:
 
-Comparalo contra lo que predeciría tu curva de threads local, ajustada al
-core count real de la VPS que elegiste (la tabla de la sección anterior
-sobre CCX/CPX ya te da el punto de partida). Si el tiempo real:
+   | Etapa | Tiempo (desarrollo, referencia) | Tiempo (producción, este video) |
+   |---|---|---|
+   | download | ~78-273s (varió con la red) | |
+   | transcribe | ~254-262s | |
+   | translate | ~30-40s | |
+   | burn | ~348-395s (video de 34min) | |
+   | **total** | ~700-950s (video de 34min) | |
 
-- **Coincide** con la proyección (dentro de ~10-15% de margen, que es el
-  orden de la varianza que ya vimos entre corridas "idénticas" en
-  desarrollo) -- confirmado, seguí con la config actual.
-- **Es sistemáticamente peor**, sobre todo si varía mucho entre corridas
-  del mismo video -- señal de steal time si estás en CPX (migrá esos
-  workers a CCX), o de otro cuello de botella específico del hardware que
-  hay que investigar con el mismo método que usamos acá (logs de `etapa`,
-  `docker exec ... env`, comparar contra el benchmark aislado).
+   Los números de "desarrollo" son de un video de 34 minutos, no 1 hora --
+   no son comparables 1 a 1 en valor absoluto, sirven como referencia de
+   forma/proporción entre etapas, no de magnitud exacta.
 
-Con ese número real (no proyectado) es que corresponde decidir si el burn
-distribuido (`ARCHITECTURE.md`) sigue valiendo la complejidad.
+### Cómo interpretarlo
 
-## TLS / dominio propio
+- **`burn`/`transcribe` escalan mal comparado con la curva de threads
+  local** (ajustada al core count real de tu VPS, ver la tabla de
+  CAX/CPX/CCX más arriba) -- señal de steal time si estás en CPX (migrá
+  esos workers a CCX), o de que el rendimiento por-core de ARM no era tan
+  competitivo como esperabas si estás en CAX.
+- **Corridas del mismo video dan tiempos muy distintos entre sí** --
+  también apunta a steal time (contención variable con otros inquilinos
+  del host físico), más que a un problema determinístico del código.
+- **Todo coincide con la proyección** (dentro de ~10-15%, el orden de
+  varianza que ya vimos entre corridas "idénticas" en desarrollo) --
+  confirmado, la config actual sirve tal cual.
 
-`docker-compose.prod.yml` expone la API en el puerto 80 sin TLS. Para
-producción real, poné un reverse proxy (Caddy o nginx + certbot) delante
-de la VPS combinada y apuntá el puerto 443 ahí.
+Con ese número real (no proyectado) es que corresponde retomar las tres
+cosas postergadas: burn distribuido, comparación visual batched vs.
+secuencial, y la causa raíz de los threads huérfanos (ver
+`ARCHITECTURE.md` para las tres).
 
 ## Alternativa: si preferís el reparto original (1 servicio = 1 VPS)
 

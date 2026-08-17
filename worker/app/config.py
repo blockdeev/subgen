@@ -48,6 +48,21 @@ class WorkerSettings(BaseSettings):
     # gatillar rate-limiting agresivo de Google; cada lote individual ya
     # tiene su propio backoff si lo pega igual (ver translate.py).
     translate_concurrency: int = Field(default=2)
+    # Mitigación (no arregla la causa raíz, ver ARCHITECTURE.md "Problemas
+    # conocidos"): con concurrency=1, esto fuerza un proceso NUEVO del pool
+    # de Celery cada N tareas -- cualquier thread huérfano de ctranslate2
+    # o proceso de FFmpeg que haya quedado vivo dentro del proceso viejo
+    # muere junto con él. 1 = proceso nuevo en cada job (máxima protección,
+    # recarga el modelo Whisper cada vez, ~1.5s medido -- despreciable
+    # contra jobs de decenas de minutos). 0 o negativo = deshabilitado
+    # (comportamiento viejo, sin esta protección).
+    celery_max_tasks_per_child: int = Field(default=1)
+    # Chequeo pre-vuelo antes de arrancar un job: si no hay al menos esto
+    # de espacio libre en el disco de work_dir, falla YA en vez de a mitad
+    # de un burn largo. ~500MB de source + ~1GB de output por job (según
+    # medición real) -- 3GB da margen para eso más limpieza pendiente.
+    # <= 0 deshabilita el chequeo.
+    min_free_disk_mb: int = Field(default=3072)
 
     # Límites de negocio
     max_video_duration_seconds: int = Field(default=3600, description="0 = sin límite")

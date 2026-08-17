@@ -961,6 +961,107 @@ class TestCleanupStaleWorkdirs:
         assert calls == ["job-cleanup-check"]
 
 
+class TestWorkDirCleanedUpOnFailure:
+    """El bloqueante de espacio en disco pedía verificar que la limpieza
+    cubre fallos y cancelaciones, no solo el camino feliz. El `finally`
+    de process_video corre para CUALQUIER excepción (está a nivel del
+    try más externo) -- estos tests lo confirman con ejecución real, no
+    solo leyendo el código."""
+
+    def test_workdir_removed_after_deterministic_error(self, task_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(task_env, "download_audio_only", lambda *a, **kw: (_ for _ in ()).throw(
+            DeterministicPipelineError("boom")))
+
+        job_id = "job-fail-det"
+        with pytest.raises(DeterministicPipelineError):
+            task_env.process_video.apply(args=(job_id, "https://example.com/v", "es", "srt")).get()
+
+        assert not (tmp_path / "work" / job_id).exists(), "el work_dir debería haberse borrado igual, aunque el job falló"
+
+    def test_workdir_removed_after_unexpected_exception(self, task_env, tmp_path, monkeypatch):
+        monkeypatch.setattr(task_env, "download_audio_only", lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("algo totalmente inesperado")))
+
+        job_id = "job-fail-unexpected"
+        with pytest.raises(RuntimeError):
+            task_env.process_video.apply(args=(job_id, "https://example.com/v", "es", "srt")).get()
+
+        assert not (tmp_path / "work" / job_id).exists(), "incluso una excepción no prevista tiene que limpiar el work_dir"
+
+    def test_workdir_removed_after_success_too(self, task_env, tmp_path, monkeypatch):
+        from app.pipeline.download import DownloadResult
+        from app.pipeline.translate import TranslatedSegment
+
+        monkeypatch.setattr(
+            task_env, "download_audio_only",
+            lambda *a, **kw: DownloadResult(path=tmp_path / "audio.mp3", title="t", duration=1.0),
+        )
+        monkeypatch.setattr(task_env, "transcribe", lambda *a, **kw: [Segment(start=0, end=1, text="hi")])
+        monkeypatch.setattr(
+            task_env, "translate",
+            lambda *a, **kw: [TranslatedSegment(start=0, end=1, text_original="hi", text="hola")],
+        )
+
+        job_id = "job-success"
+        task_env.process_video.apply(args=(job_id, "https://example.com/v", "es", "srt")).get()
+
+        assert not (tmp_path / "work" / job_id).exists()
+
+
+class TestDiskSpaceCheck:
+    """Chequeo pre-vuelo: falla RÁPIDO si no hay margen de disco, en vez
+    de romperse a mitad de un burn largo."""
+
+    def test_raises_deterministic_error_when_space_is_low(self, task_env, monkeypatch):
+        import shutil as shutil_module
+        from unittest.mock import MagicMock as MM
+
+        fake_usage = MM(free=100 * 1024 * 1024)  # 100MB libres
+        monkeypatch.setattr(shutil_module, "disk_usage", lambda path: fake_usage)
+        monkeypatch.setattr(task_env.settings, "min_free_disk_mb", 3072)
+
+        with pytest.raises(DeterministicPipelineError, match="[Ee]spacio en disco"):
+            task_env._check_disk_space(3072)
+
+    def test_passes_when_space_is_sufficient(self, task_env, monkeypatch):
+        import shutil as shutil_module
+        from unittest.mock import MagicMock as MM
+
+        fake_usage = MM(free=10 * 1024 * 1024 * 1024)  # 10GB libres
+        monkeypatch.setattr(shutil_module, "disk_usage", lambda path: fake_usage)
+
+        task_env._check_disk_space(3072)  # no debe lanzar nada
+
+    def test_zero_or_negative_disables_the_check(self, task_env, monkeypatch):
+        import shutil as shutil_module
+
+        def boom(path):
+            raise AssertionError("no debería llamarse a disk_usage con el chequeo deshabilitado")
+
+        monkeypatch.setattr(shutil_module, "disk_usage", boom)
+        task_env._check_disk_space(0)
+        task_env._check_disk_space(-1)
+
+    def test_low_disk_space_fails_the_job_without_retry(self, task_env, tmp_path, monkeypatch):
+        """Confirma que el chequeo, enganchado adentro de process_video,
+        efectivamente frena el job ANTES de arrancar download -- no solo
+        que la función aislada lanza la excepción."""
+        import shutil as shutil_module
+        from unittest.mock import MagicMock as MM
+
+        fake_usage = MM(free=1 * 1024 * 1024)  # 1MB libres
+        monkeypatch.setattr(shutil_module, "disk_usage", lambda path: fake_usage)
+        monkeypatch.setattr(task_env.settings, "min_free_disk_mb", 3072)
+
+        download_calls = []
+        monkeypatch.setattr(task_env, "download_audio_only", lambda *a, **kw: download_calls.append(1))
+
+        with pytest.raises(DeterministicPipelineError, match="[Ee]spacio en disco"):
+            task_env.process_video.apply(args=("job-disk-full", "https://example.com/v", "es", "srt")).get()
+
+        assert download_calls == [], "no debería haber arrancado la descarga si no hay espacio"
+
+
 class TestTaskExceptionPaths:
 
     def test_storage_error_is_not_retried(self, task_env, tmp_path, monkeypatch):
@@ -1242,3 +1343,24 @@ class TestCpuThreadsAndBatchedInference:
         finally:
             import importlib
             importlib.reload(transcribe_module)
+
+
+class TestResolveMaxTasksPerChild:
+    """Mitigación de threads huérfanos (worker_max_tasks_per_child) --
+    ver ARCHITECTURE.md 'Problemas conocidos' para el contexto completo."""
+
+    def test_positive_value_used_as_is(self):
+        from app.celery_app import resolve_max_tasks_per_child
+        assert resolve_max_tasks_per_child(1) == 1
+        assert resolve_max_tasks_per_child(5) == 5
+
+    def test_zero_or_negative_disables_the_mitigation(self):
+        from app.celery_app import resolve_max_tasks_per_child
+        assert resolve_max_tasks_per_child(0) is None
+        assert resolve_max_tasks_per_child(-1) is None
+
+    def test_default_setting_applies_to_the_real_celery_conf(self):
+        """No solo la función pura -- confirma que el valor realmente
+        llega al conf de la app de Celery, no que se quede sin usar."""
+        from app.celery_app import celery_app
+        assert celery_app.conf.worker_max_tasks_per_child == 1

@@ -181,3 +181,75 @@ real:
   `concat_segments`, y el manejo de errores/cleanup -- nada de esto está
   implementado en `tasks.py` todavía, es la especificación para cuando se
   retome.
+
+---
+
+# Problemas conocidos (independiente del diseño de arriba)
+
+Documentado acá porque es el mismo tipo de decisión que el resto de este
+archivo: un problema real, con una mitigación aplicada, pendiente de
+diagnóstico de causa raíz cuando haya tiempo -- no bloqueante para
+producción, pero tampoco resuelto del todo.
+
+## Threads huérfanos de ctranslate2/Whisper
+
+**Síntoma observado en vivo, más de una vez**: un worker queda
+consumiendo 800%+ de CPU sostenido, sin ninguna tarea activa según
+`celery -A app.celery_app inspect active` (confirmado con dos fuentes
+coincidiendo: la UI sin ningún job visible, y Celery mismo reportando
+`- empty -` en los dos nodos). El proceso responsable NO es un `ffmpeg`
+separado (ya conocíamos ese patrón, distinto) -- es el mismo PID del
+worker de Celery, con el conteo de threads/PIDs de `docker stats` muy por
+encima de lo esperable para `concurrency=1`.
+
+**Hipótesis, sin confirmar todavía**: un pool de threads interno de
+`ctranslate2` (el motor detrás de `faster-whisper`) que sobrevive a una
+interrupción fuerte de la tarea que lo inició -- un `SIGKILL` externo
+(cancelación de job, `docker compose kill`, un cuelgue del host) no le da
+chance a Python de correr limpieza, y a diferencia de un subproceso
+(`ffmpeg`, que si se le manda `kill` muere entero), un thread-pool
+*dentro* del mismo proceso puede seguir vivo aunque la tarea de Celery
+que lo lanzó ya haya sido abandonada. No investigado a fondo -- es una
+hipótesis razonable, no una causa confirmada.
+
+**Mitigación aplicada (no arregla la causa raíz):**
+`SUBGEN_CELERY_MAX_TASKS_PER_CHILD` (default `1`), que se traduce en
+`worker_max_tasks_per_child=1` de Celery. Con `concurrency=1`, esto
+fuerza que el pool de Celery recicle el proceso del worker después de
+CADA tarea -- cualquier thread huérfano que haya quedado vivo dentro de
+ese proceso muere junto con él, sin excepción, porque el sistema operativo
+se encarga de matar el proceso entero, no algo que dependa de que nuestro
+código Python se entere.
+
+**Trade-off, medido**: recargar el modelo Whisper cuesta ~1.5s (medido en
+los logs reales de esta sesión, línea "Modelo Whisper cargado"). Contra
+un job que tarda decenas de minutos a horas (transcripción + quemado de
+un video largo), esto es completamente despreciable -- no hay razón para
+NO tener esto activado en producción. Queda configurable
+(`SUBGEN_CELERY_MAX_TASKS_PER_CHILD=0` deshabilita) solo por si en algún
+escenario de desarrollo/debugging puntual se quiere el comportamiento
+viejo (proceso persistente entre tareas, más rápido de iterar).
+
+**Qué falta para cerrar esto de verdad** (postergado explícitamente,
+retomar con tiempo dedicado, no en medio de otra cosa):
+- Reproducir el síntoma de forma controlada (no solo haberlo visto
+  aparecer en medio de sesiones de debugging con muchas cancelaciones
+  encadenadas).
+- Confirmar o descartar la hipótesis del thread-pool de `ctranslate2`
+  específicamente -- por ejemplo, inspeccionando con `py-spy` o similar
+  qué está corriendo de verdad dentro del proceso cuando aparece el
+  síntoma, en vez de inferirlo indirectamente.
+- Si se confirma, ver si `ctranslate2`/`faster-whisper` expone algún
+  mecanismo de cierre explícito del pool de threads que se pueda
+  enganchar en un `finally`, en vez de depender de reciclar el proceso
+  entero.
+
+**Nota**: no es el único caso de "algo puede sobrevivir a la tarea que lo
+lanzó" en este proyecto -- el burn de FFmpeg tiene el mismo problema de
+fondo con su propio subproceso (ver el `finally` de
+`_run_ffmpeg_with_progress` en `worker/app/pipeline/burn.py`, que sí
+tiene un `kill()` explícito para ESE caso puntual). La diferencia es que
+un subproceso se puede matar desde afuera con `kill()`; un thread-pool
+*dentro* del mismo proceso Python no tiene un equivalente tan directo --
+por eso la mitigación acá es reciclar el proceso entero, no un kill
+puntual.

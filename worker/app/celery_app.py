@@ -8,6 +8,14 @@ from app.config import get_settings
 from app.logging_config import configure_logging
 from app.storage import ensure_bucket
 
+
+def resolve_max_tasks_per_child(configured: int) -> int | None:
+    """`configured <= 0` deshabilita la mitigación (comportamiento viejo,
+    sin límite). `configured > 0` fuerza un proceso nuevo del worker cada
+    esa cantidad de tareas -- ver ARCHITECTURE.md "Problemas conocidos"."""
+    return configured if configured > 0 else None
+
+
 settings = get_settings()
 configure_logging(settings.log_level)
 
@@ -48,6 +56,10 @@ celery_app.conf.update(
     broker_transport_options={
         "visibility_timeout": settings.celery_task_time_limit + 300,
     },
+    # Mitigación de threads huérfanos de ctranslate2/FFmpeg -- ver
+    # ARCHITECTURE.md "Problemas conocidos" para el detalle completo y por
+    # qué esto es mitigación, no arreglo de causa raíz. None = deshabilitado.
+    worker_max_tasks_per_child=resolve_max_tasks_per_child(settings.celery_max_tasks_per_child),
     beat_schedule={
         "cleanup-expired-outputs": {
             "task": "app.tasks.cleanup_expired_outputs",

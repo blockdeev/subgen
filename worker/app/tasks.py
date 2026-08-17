@@ -128,6 +128,26 @@ def _cleanup_stale_workdirs(current_job_id: str) -> None:
             continue
 
 
+def _check_disk_space(min_free_mb: int) -> None:
+    """Chequeo pre-vuelo antes de arrancar el trabajo real de un job.
+    Sin esto, quedarse sin espacio a mitad de un burn de un video de 1h
+    (después de 20+ minutos de trabajo ya hecho: download+transcribe)
+    es un fallo mucho más caro y confuso que fallar rápido al arrancar.
+    `DeterministicPipelineError` -- no tiene sentido que Celery reintente
+    esto, el espacio no se va a liberar solo entre un intento y el otro.
+    """
+    if min_free_mb <= 0:
+        return  # deshabilitado explícito
+    usage = shutil.disk_usage(settings.work_dir)
+    free_mb = usage.free / (1024 * 1024)
+    if free_mb < min_free_mb:
+        raise DeterministicPipelineError(
+            f"Espacio en disco insuficiente para arrancar: {free_mb:.0f}MB libres, "
+            f"se requieren al menos {min_free_mb}MB. Liberá espacio en este worker "
+            f"(ver /tmp/subgen) o esperá a la limpieza periódica."
+        )
+
+
 def _publish_terminal(job_id: str, status: str, **extra: Any) -> None:
     payload = {"job_id": job_id, "status": status, **extra}
     _publisher.publish(job_id, payload)
@@ -155,6 +175,8 @@ def process_video(
     effective_fps = output_fps if output_fps > 0 else settings.default_burn_fps
 
     try:
+        _check_disk_space(settings.min_free_disk_mb)
+
         video_path: Path | None = None
 
         with _stage_timer(job_id, "download"):
