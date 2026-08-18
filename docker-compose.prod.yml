@@ -31,8 +31,12 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # Bindear al puerto de la red PRIVADA, nunca 0.0.0.0 en producción --
-    # lo necesitan alcanzar las VPS de worker, no internet.
+    # CRÍTICO -- confirmado en un despliegue real: sin PRIVATE_IP seteada
+    # en .env, esto cae al fallback 0.0.0.0 y Redis (sin contraseña) queda
+    # expuesto a TODO internet. El firewall de ufw NO alcanza a protegerlo
+    # -- Docker manipula iptables directo al publicar puertos, y esas
+    # reglas pueden saltearse las de ufw. Setear PRIVATE_IP=<ip-privada-real>
+    # en .env es obligatorio, no opcional (ver DEPLOYMENT.md paso 8).
     ports:
       - "${PRIVATE_IP:-0.0.0.0}:6379:6379"
     healthcheck:
@@ -57,7 +61,10 @@ services:
     # puntual.
     ports:
       - "9000:9000"
-      - "${PRIVATE_IP:-0.0.0.0}:9001:9001"   # consola de administración: privada nomás
+      # La CONSOLA (9001, no el puerto 9000 de arriba) sí tiene que ser
+      # privada -- mismo aviso crítico que en redis: sin PRIVATE_IP seteada,
+      # cae a 0.0.0.0 y queda pública.
+      - "${PRIVATE_IP:-0.0.0.0}:9001:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s

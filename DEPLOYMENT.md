@@ -396,8 +396,39 @@ docker compose logs worker-1 worker-2 | grep -iE "sign in|exporting.*cookies"
   `SUBGEN_S3_PUBLIC_ENDPOINT_URL` con la URL que va a usar el navegador
   del usuario. `SUBGEN_CORS_ORIGINS` con tu dominio público. Las
   credenciales del paso 6, no las de `.env.example`.
+
+  **`PRIVATE_IP` -- no te lo saltees, es crítico.** `docker-compose.prod.yml`
+  bindea Redis y la consola de MinIO con `${PRIVATE_IP:-0.0.0.0}`: si esta
+  variable no está seteada, el fallback es `0.0.0.0` -- público, sin
+  autenticación en Redis. **El firewall de `ufw` del paso 4 NO te salva
+  acá**: Docker manipula `iptables` directamente al publicar puertos, y
+  esas reglas pueden saltearse las de `ufw` (problema real y documentado,
+  no una posibilidad remota -- lo confirmamos en vivo durante este
+  despliegue). Conseguí la IP privada real de esta VPS en el panel de
+  Hetzner (Servers → tu servidor → se ve junto a la IP pública) y agregala:
+  ```
+  PRIVATE_IP=10.0.0.X
+  ```
+  Después de setearla (o cambiarla), siempre recreá los contenedores
+  afectados para que el binding nuevo tome efecto:
+  ```bash
+  docker compose -f docker-compose.prod.yml up -d redis minio
+  ```
+  **Verificá de verdad, no asumas** -- desde tu máquina local, no desde la
+  VPS:
+  ```bash
+  timeout 3 bash -c "echo > /dev/tcp/<IP-PÚBLICA-DE-LA-VPS>/6379" \
+    && echo "PUERTO ABIERTO -- mal" || echo "cerrado o timeout -- bien"
+  ```
+  Tiene que decir "cerrado o timeout". Confirmá también con
+  `docker compose -f docker-compose.prod.yml ps` que la columna `PORTS`
+  muestre la IP privada (`10.0.0.X:6379->6379/tcp`) y nunca `0.0.0.0` para
+  Redis ni para el puerto 9001 de MinIO.
+
 - **VPS de worker**: `SUBGEN_REDIS_URL=redis://<IP-PRIVADA-DE-LA-VPS-COMBINADA>:6379/0`.
   Mismas `SUBGEN_S3_*` que la combinada (mismo bucket). Cookies del paso 7.
+  Los workers no publican ningún puerto propio, así que `PRIVATE_IP` no
+  aplica de este lado -- solo importa en la VPS combinada.
 
 ### 9. TLS con Caddy -- para el dominio público
 
@@ -475,7 +506,14 @@ docker exec subgen-worker-1-1 celery -A app.celery_app inspect ping
 
 # 4. Cookies de YouTube (paso 7, si todavía no lo hiciste)
 
-# 5. Recién ahí: un job real de prueba, corto, para confirmar el pipeline
+# 5. Redis y la consola de MinIO NO son alcanzables desde internet --
+#    no es opcional, confirmalo siempre, desde tu máquina local (no
+#    desde la VPS):
+timeout 3 bash -c "echo > /dev/tcp/<IP-PÚBLICA-DE-LA-VPS-COMBINADA>/6379" \
+  && echo "PUERTO ABIERTO -- mal, revisar PRIVATE_IP en .env (paso 8)" \
+  || echo "cerrado o timeout -- bien"
+
+# 6. Recién ahí: un job real de prueba, corto, para confirmar el pipeline
 #    completo de punta a punta antes de anunciar nada públicamente
 ```
 
