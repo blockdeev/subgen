@@ -237,7 +237,17 @@ Asume que arrancás de cero, con las VPS recién creadas y nada más.
 las VPS (la combinada y todas las de worker) a esa red. Anotá las IPs
 privadas de cada una.
 
-### 3. Instalar Docker en todas
+### 3. Actualizar el sistema e instalar Docker en todas
+
+```bash
+apt update
+apt upgrade -y
+```
+
+Si actualiza el kernel, te va a pedir reiniciar (`reboot`) -- es seguro, todos los
+contenedores de este proyecto usan `restart: unless-stopped` y Docker
+arranca solo al boot, así que todo vuelve solo después del reinicio.
+Esperá un minuto y reconectate por SSH.
 
 ```bash
 curl -fsSL https://get.docker.com | sh

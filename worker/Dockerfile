@@ -34,6 +34,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
+# yt-dlp necesita un runtime de JS para resolver el PoToken de YouTube
+# (su sistema de verificación de origen) y acceder al set completo de
+# formatos -- sin esto, cae a un subconjunto reducido, que en producción
+# se manifestó como "Requested format is not available" (confirmado en
+# un deploy real desde IP de datacenter, donde YouTube es más estricto
+# que desde una IP residencial). deno es el runtime que yt-dlp detecta
+# automático si está en el PATH, sin flags extra.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && apt-get purge -y curl unzip && apt-get autoremove -y
+
 RUN groupadd --gid 1000 subgen && \
     useradd --uid 1000 --gid subgen --shell /bin/bash --create-home subgen
 

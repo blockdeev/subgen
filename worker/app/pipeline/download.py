@@ -139,6 +139,15 @@ def download_audio_only(
         "no_warnings": True,
         "noplaylist": True,
         "progress_hooks": [_make_hook(job_id, on_progress)],
+        # Sin esto, YouTube puede servir un set reducido de formatos (el
+        # PoToken de verificación de origen queda sin resolver) -- se
+        # manifiesta como "Requested format is not available", confirmado
+        # en un deploy real desde IP de datacenter (mucho más estricto que
+        # desde una IP residencial). "ejs:github" baja el script solucionador
+        # del propio repo de yt-dlp, no de un tercero. Necesita además un
+        # runtime de JS instalado (deno, ver Dockerfile) -- las dos cosas
+        # juntas son las que arreglan esto, ninguna sola alcanza.
+        "remote_components": ["ejs:github"],
     }, cookies_file, downloads_dir)
 
     try:
@@ -181,6 +190,7 @@ def download_video_full(
         "no_warnings": True,
         "noplaylist": True,
         "progress_hooks": [_make_hook(job_id, on_progress)],
+        "remote_components": ["ejs:github"],  # ver comentario en download_audio_only
     }, cookies_file, downloads_dir)
 
     try:
