@@ -554,56 +554,50 @@ Prestá atención puntual a:
 ## Medir en producción, apenas esté arriba
 
 Todas las decisiones de rendimiento de este proyecto (códec, fps de
-salida, preset/crf, traducción concurrente, y CCX vs CPX) están basadas
-en mediciones sobre **una máquina de desarrollo de 32 cores**, no en el
-hardware real de producción. El burn distribuido, el batched de Whisper,
-y la causa raíz de los threads huérfanos quedaron explícitamente
-pendientes de este dato (ver `ARCHITECTURE.md`) -- pero en rigor,
-**todas** las proyecciones de esta sección de deploy también.
+salida, preset/crf, traducción concurrente, y CCX vs CPX) estaban
+basadas originalmente en mediciones sobre **una máquina de desarrollo de
+32 cores**, no en el hardware real de producción. **Esto ya se midió
+-- ver "Resultados reales" más abajo.** El burn distribuido, el batched
+de Whisper, y la causa raíz de los threads huérfanos siguen pendientes
+de retomar (ver `ARCHITECTURE.md`).
 
-### Procedimiento
+### Resultados reales (CPX32, 4 vCPU compartidos, agosto 2026)
 
-1. Conseguí un video real de **~1 hora** (no el de 34 minutos de
-   desarrollo -- más largo, para que cualquier variación se note más).
-2. Mandalo en modo video, 30fps (el default).
-3. Capturá el desglose completo apenas termine:
-   ```bash
-   docker compose -f docker-compose.prod.yml logs worker-1 worker-2 worker-3 \
-     2>/dev/null | grep -E "received|succeeded|etapa"
-   ```
-   (ajustá los nombres de worker a los que tengas realmente desplegados)
-4. Completá la tabla:
+Tres jobs completos de producción, videos reales de YouTube, sin
+optimizaciones adicionales más allá de lo ya documentado:
 
-   | Etapa | Tiempo (desarrollo, referencia) | Tiempo (producción, este video) |
-   |---|---|---|
-   | download | ~78-273s (varió con la red) | |
-   | transcribe | ~254-262s | |
-   | translate | ~30-40s | |
-   | burn | ~348-395s (video de 34min) | |
-   | **total** | ~700-950s (video de 34min) | |
+| Duración video | download | transcribe | translate | burn | TOTAL | fps burn |
+|---|---|---|---|---|---|---|---|
+| 9.3 min | 41.9s | 96.9s | 112.3s | 239.3s | 490.9s | ~95 |
+| 37.9 min | 204.9s | 331.0s | 690.2s | 640.5s | 1867.9s | ~105 |
+| 63.8 min | 132.4s | 656.4s | 683.7s | 1296.3s | 2771.8s | ~88 |
 
-   Los números de "desarrollo" son de un video de 34 minutos, no 1 hora --
-   no son comparables 1 a 1 en valor absoluto, sirven como referencia de
-   forma/proporción entre etapas, no de magnitud exacta.
+**Conclusión sobre CPX vs. CCX**: las tres corridas completaron sin
+degradación errática ni caídas de rendimiento a mitad de job -- la
+variación de `fps` de `burn` (42 a 105, según otra corrida intermedia
+no tabulada arriba) se explica por **complejidad de contenido** (más
+movimiento en cámara = más caro de codificar), no por steal time. No
+hay evidencia en estos datos que justifique pagar el 2x de CCX por
+ahora. Salvedad honesta: 3 corridas en una sesión no descartan
+contención futura con otro inquilino del mismo host físico -- si en
+producción sostenida empezás a ver tiempos erráticos entre corridas
+similares, ahí sí sería la señal para reconsiderar.
 
-### Cómo interpretarlo
+**Hallazgo separado, real y consistente**: `translate` tardó
+prácticamente lo mismo (690.2s y 683.7s) en dos videos de duración muy
+distinta -- sugiere que se está pegando contra un techo de rate-limit
+de Google Translate bastante estable desde esta IP de datacenter, no
+ruido aleatorio. Si esto sigue así, vale la pena probar
+`SUBGEN_TRANSLATE_CONCURRENCY=1` (en vez de 2) para ver si menos
+paralelismo dispara menos el throttling en primer lugar.
 
-- **`burn`/`transcribe` escalan mal comparado con la curva de threads
-  local** (ajustada al core count real de tu VPS, ver la tabla de
-  CAX/CPX/CCX más arriba) -- señal de steal time si estás en CPX (migrá
-  esos workers a CCX), o de que el rendimiento por-core de ARM no era tan
-  competitivo como esperabas si estás en CAX.
-- **Corridas del mismo video dan tiempos muy distintos entre sí** --
-  también apunta a steal time (contención variable con otros inquilinos
-  del host físico), más que a un problema determinístico del código.
-- **Todo coincide con la proyección** (dentro de ~10-15%, el orden de
-  varianza que ya vimos entre corridas "idénticas" en desarrollo) --
-  confirmado, la config actual sirve tal cual.
-
-Con ese número real (no proyectado) es que corresponde retomar las tres
-cosas postergadas: burn distribuido, comparación visual batched vs.
-secuencial, y la causa raíz de los threads huérfanos (ver
-`ARCHITECTURE.md` para las tres).
+**También encontrado, no anticipado originalmente**:
+`SUBGEN_MAX_VIDEO_DURATION_SECONDS` (default 3600s/60min) y los límites
+de tiempo de Celery necesitan subirse juntos si vas a aceptar videos
+largos -- ver el incidente real documentado en `ARCHITECTURE.md`
+"Problemas conocidos" (o el historial de esta sesión) para el cálculo
+completo. Quedaron en `9000`/`9500`/`9800` respectivamente en esta
+VPS -- ajustá según qué duración máxima quieras aceptar vos.
 
 ## Alternativa: si preferís el reparto original (1 servicio = 1 VPS)
 
