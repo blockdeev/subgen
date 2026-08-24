@@ -1,0 +1,25 @@
+# Plantilla de Caddyfile para producción -- ver DEPLOYMENT.md paso 9 para
+# el contexto completo. Copiar a /etc/caddy/Caddyfile en la VPS combinada
+# y reemplazar los dos dominios por los reales.
+
+# API + frontend. 127.0.0.1, NUNCA localhost -- localhost puede resolver
+# a [::1] (IPv6) primero, y si la API solo escucha en IPv4 eso da
+# "dial tcp [::1]:8000: connection refused" (502), confirmado en un
+# deploy real -- no es un problema de la API, es la resolución ambigua
+# del nombre.
+tu-dominio.com {
+    reverse_proxy 127.0.0.1:8000
+}
+
+# MinIO/S3, en un subdominio aparte, con su propio certificado.
+#
+# No es opcional si tu dominio es .dev: Google tiene TODO el TLD .dev
+# precargado (HSTS preload) en los navegadores desde 2017, forzando
+# HTTPS en cualquier puerto de cualquier dominio .dev, sin que el
+# servidor pueda evitarlo. Servir MinIO en HTTP plano directo por
+# tu-dominio.dev:9000 falla con SSL_ERROR_RX_RECORD_TOO_LONG en
+# cualquier navegador -- confirmado en un deploy real. La solución es
+# ponerlo también detrás de Caddy, acá.
+files.tu-dominio.com {
+    reverse_proxy 127.0.0.1:9000
+}

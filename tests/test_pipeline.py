@@ -46,6 +46,31 @@ class TestClassifyDownloadErrors:
         with pytest.raises(TransientDownloadError):
             _classify_and_raise(exc)
 
+    def test_http_429_is_transient(self):
+        exc = yt_dlp.utils.DownloadError("HTTP Error 429: Too Many Requests")
+        with pytest.raises(TransientDownloadError):
+            _classify_and_raise(exc)
+
+    def test_lbry_no_formats_found_is_treated_as_hidden_rate_limit(self):
+        """Caso real encontrado en producción (Odysee): el 429 real queda
+        en un WARNING intermedio que yt-dlp descarta -- la excepción final
+        del extractor lbry solo dice "No video formats found!", sin
+        mención del 429 real. Sin este caso especial, se clasificaría
+        como determinístico y nunca se reintentaría."""
+        exc = yt_dlp.utils.DownloadError(
+            "ERROR: [lbry] abc123: No video formats found!; please report this issue..."
+        )
+        with pytest.raises(TransientDownloadError):
+            _classify_and_raise(exc)
+
+    def test_no_formats_found_from_other_extractors_stays_deterministic(self):
+        # El caso especial de arriba es puntual del extractor lbry -- un
+        # "no video formats" de cualquier otro extractor (sin "[lbry]" en
+        # el mensaje) sigue siendo determinístico, no se reintenta a ciegas.
+        exc = yt_dlp.utils.DownloadError("ERROR: [youtube] abc123: No video formats found!")
+        with pytest.raises(DownloadError):
+            _classify_and_raise(exc)
+
     def test_non_ytdlp_exception_defaults_to_transient(self):
         # Cualquier excepción que no sea de yt-dlp (p.ej. un error de red
         # más bajo nivel) se trata como transitoria: preferimos reintentar

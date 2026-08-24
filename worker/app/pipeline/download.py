@@ -89,6 +89,22 @@ def _classify_and_raise(exc: Exception) -> None:
 
     if isinstance(exc, yt_dlp.utils.DownloadError):
         msg = str(exc).lower()
+        rate_limit_markers = ("429", "too many requests")
+        # El extractor de lbry/Odysee pierde el detalle del 429 en el
+        # mensaje final -- queda solo "No video formats found!" (confirmado
+        # en vivo: el 429 real aparece en un WARNING intermedio -- "Unable
+        # to download webpage: HTTP Error 429" -- que se descarta antes de
+        # llegar a esta excepción). Lo detectamos igual por este patrón
+        # puntual del extractor. Peor caso si el patrón da falso positivo:
+        # 3 reintentos de más antes de fallar igual (celery_max_retries),
+        # no hay riesgo de loop infinito.
+        is_lbry_hidden_rate_limit = "[lbry]" in msg and "no video formats found" in msg
+        if any(m in msg for m in rate_limit_markers) or is_lbry_hidden_rate_limit:
+            raise TransientDownloadError(
+                "La plataforma de origen está limitando las descargas en "
+                "este momento. Reintentando automáticamente."
+            ) from exc
+
         transient_markers = ("timed out", "timeout", "connection reset", "temporary failure",
                               "503", "502", "504", "network")
         if any(m in msg for m in transient_markers):

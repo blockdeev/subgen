@@ -454,19 +454,66 @@ curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo 
 sudo apt update && sudo apt install caddy
 ```
 
-`/etc/caddy/Caddyfile`:
+`/etc/caddy/Caddyfile` -- hay una plantilla lista en `deploy/Caddyfile.example`
+del repo, copiala y ajustá los dos dominios:
 
 ```
 tu-dominio.com {
-    reverse_proxy localhost:8000
+    reverse_proxy 127.0.0.1:8000
+}
+
+files.tu-dominio.com {
+    reverse_proxy 127.0.0.1:9000
 }
 ```
 
+**Dos detalles no obvios, los dos confirmados con un bug real en un
+deploy real -- no los saltees:**
+
+- **`127.0.0.1:8000`, nunca `localhost:8000`.** `localhost` puede resolver
+  primero a `[::1]` (loopback IPv6) en sistemas modernos, y si la API
+  solo escucha en IPv4, Caddy tira `dial tcp [::1]:8000: connection
+  refused` -- un 502 que no tiene nada que ver con que la API esté mal,
+  solo con la ambigüedad de a qué interfaz resuelve `localhost`.
+
+- **El segundo bloque (MinIO en un subdominio aparte) no es opcional
+  si tu dominio es `.dev`.** Google es dueño de ese TLD y lo tiene
+  precargado (HSTS preload) en todos los navegadores desde 2017 -- fuerza
+  HTTPS en **todo puerto** de cualquier dominio `.dev`, sin que el
+  servidor pueda evitarlo ni el usuario desactivarlo. Si servís MinIO en
+  HTTP plano directo por `tu-dominio.dev:9000`, todo navegador va a
+  intentar HTTPS ahí igual y fallar con `SSL_ERROR_RX_RECORD_TOO_LONG`.
+  La solución real es ponerlo también detrás de Caddy, en un subdominio
+  con su propio certificado -- de ahí el segundo bloque. Con otros TLDs
+  (`.com`, `.dev` sin este problema no es tan estricto) probablemente no
+  haga falta, pero armar los dos bloques desde el principio evita
+  descubrir esto a los golpes como pasó acá.
+
 Reiniciar Caddy (`sudo systemctl restart caddy`) y listo -- HTTPS
-automático, certificado renovado solo. Con esto activo, en
-`docker-compose.prod.yml` el puerto de `api` puede quedar bindeado solo a
-`127.0.0.1:8000:8000` en vez de `80:8000` público directo (Caddy es el
-único que necesita alcanzarlo, y ya corre en la misma máquina).
+automático, certificado renovado solo, para los dos dominios.
+
+**Antes de reiniciar Caddy, cambiá el binding de la API** en
+`docker-compose.prod.yml` (si no, Caddy y la API van a pelearse por el
+puerto 80 -- otro error real ya visto: `address already in use`):
+
+```yaml
+    ports:
+      - "127.0.0.1:8000:8000"   # ya no "80:8000" directo -- Caddy es el único que lo alcanza
+```
+
+```bash
+docker compose -f docker-compose.prod.yml up -d api
+```
+
+**DNS**: además del registro `A` para `tu-dominio.com` (paso 3), agregá
+uno igual para `files.tu-dominio.com`, misma IP pública.
+
+**Actualizá `.env`** para que la app arme los links de descarga con el
+subdominio nuevo, no con el puerto directo:
+
+```
+SUBGEN_S3_PUBLIC_ENDPOINT_URL=https://files.tu-dominio.com
+```
 
 Actualizá `ufw` para reflejar el cambio: cerrá el 80/8000 directo, dejá
 solo 443 (y 80 si querés que Caddy redirija http→https automático, que
@@ -476,6 +523,13 @@ es su comportamiento por default):
 ufw delete allow 80/tcp    # si lo habías abierto en el paso 4
 ufw allow 80/tcp           # Caddy lo usa para el challenge de Let's Encrypt y el redirect
 ufw allow 443/tcp
+```
+
+**Verificación real, no solo "no dio error"**:
+
+```bash
+curl -sI https://tu-dominio.com          # sin errores de certificado
+curl -sI https://files.tu-dominio.com    # idem -- un 400 de MinIO acá es normal, no diste un path de objeto
 ```
 
 ### 10. Orden de arranque
