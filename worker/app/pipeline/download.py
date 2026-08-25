@@ -135,17 +135,31 @@ def _maybe_add_cookies(
     return ydl_opts
 
 
+def _maybe_add_proxy(ydl_opts: dict[str, Any], proxy: Optional[str]) -> dict[str, Any]:
+    """Agrega `proxy` a ydl_opts si viene seteado y no vacío.
+
+    Vacío/None se omite a propósito en vez de pasar "" — yt-dlp interpreta
+    la cadena vacía como "ignorar cualquier proxy del entorno", que no es
+    lo mismo que "no configurar nada". Ver `ytdlp_proxy` en config.py para
+    el porqué de esta opción (reputación de IP de datacenter).
+    """
+    if proxy:
+        ydl_opts["proxy"] = proxy
+    return ydl_opts
+
+
 def download_audio_only(
     url: str,
     job_id: str,
     downloads_dir: Path,
     on_progress: ProgressCallback = noop_progress,
     cookies_file: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> DownloadResult:
     """Modo rápido: solo descarga el audio. Mismos ydl_opts que el original."""
     import yt_dlp
 
-    ydl_opts = _maybe_add_cookies({
+    ydl_opts = _maybe_add_proxy(_maybe_add_cookies({
         "format": "bestaudio/best",
         "outtmpl": str(downloads_dir / job_id) + ".%(ext)s",
         "postprocessors": [
@@ -164,7 +178,7 @@ def download_audio_only(
         # runtime de JS instalado (deno, ver Dockerfile) -- las dos cosas
         # juntas son las que arreglan esto, ninguna sola alcanza.
         "remote_components": ["ejs:github"],
-    }, cookies_file, downloads_dir)
+    }, cookies_file, downloads_dir), proxy)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -194,11 +208,12 @@ def download_video_full(
     downloads_dir: Path,
     on_progress: ProgressCallback = noop_progress,
     cookies_file: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> tuple[DownloadResult, Path]:
     """Modo completo: descarga video + extrae audio. Devuelve (video, audio_path)."""
     import yt_dlp
 
-    ydl_opts = _maybe_add_cookies({
+    ydl_opts = _maybe_add_proxy(_maybe_add_cookies({
         "format": "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
         "outtmpl": str(downloads_dir / job_id) + ".%(ext)s",
         "merge_output_format": "mp4",
@@ -207,7 +222,7 @@ def download_video_full(
         "noplaylist": True,
         "progress_hooks": [_make_hook(job_id, on_progress)],
         "remote_components": ["ejs:github"],  # ver comentario en download_audio_only
-    }, cookies_file, downloads_dir)
+    }, cookies_file, downloads_dir), proxy)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

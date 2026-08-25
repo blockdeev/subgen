@@ -74,6 +74,21 @@ class WorkerSettings(BaseSettings):
     # YouTube". Vacío = no se pasa ningún cookiefile a yt-dlp (default).
     ytdlp_cookies_file: str = Field(default="")
 
+    # Proxy de salida para yt-dlp (opcional). Existe porque las IPs de
+    # datacenter (Hetzner, DigitalOcean, etc.) están mal vistas por las
+    # plataformas de video: YouTube pide cookies constantemente y el CDN
+    # de Odysee (CDN77) devuelve 429 por reputación de rango, no por
+    # volumen real de pedidos. Verificado en producción: el MISMO video
+    # que falla desde la VPS anda perfecto desde una IP residencial.
+    #
+    # Con Cloudflare WARP como salida, YouTube descarga sin cookies
+    # (confirmado en vivo) y CDN77 deja de tirar 429. Ver DEPLOYMENT.md,
+    # sección "Proxy de salida (Cloudflare WARP)".
+    #
+    # Formato: "socks5h://IP:PUERTO" (socks5h = el proxy resuelve el DNS).
+    # Vacío = sin proxy, salida directa por la IP de la VPS (default).
+    ytdlp_proxy: str = Field(default="")
+
     # FFmpeg / quemado de subtítulos (estilo validado, NO cambiar)
     burn_font_name: str = Field(default="Arial")
     burn_font_size: int = Field(default=20)

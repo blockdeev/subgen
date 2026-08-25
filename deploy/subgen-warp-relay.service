@@ -1,0 +1,28 @@
+[Unit]
+# Relay entre la red de Docker y el proxy de Cloudflare WARP.
+#
+# WARP en modo proxy escucha SOLO en 127.0.0.1 del host, y los contenedores
+# no llegan ahí. Este relay escucha en la gateway del bridge de Docker y
+# reenvía a WARP.
+#
+# Sin esto como servicio, el relay hay que levantarlo a mano con "&" desde
+# la shell -- y muere al cerrar la sesión SSH, dejando todas las descargas
+# rotas sin aviso.
+#
+# Ver DEPLOYMENT.md, sección "Proxy de salida (Cloudflare WARP)".
+Description=Relay Docker -> Cloudflare WARP proxy (SubGen)
+After=network-online.target warp-svc.service docker.service
+Wants=network-online.target
+Requires=warp-svc.service
+
+[Service]
+# IMPORTANTE: verificar la gateway real antes de usar esto --
+#   docker network inspect subgen_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+# Suele ser 172.18.0.1 (red creada por Compose), NO 172.17.0.1 (bridge
+# default de Docker, que es la que uno asume por costumbre y no aplica acá).
+ExecStart=/usr/bin/socat TCP-LISTEN:40001,bind=172.18.0.1,fork,reuseaddr TCP:127.0.0.1:40000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

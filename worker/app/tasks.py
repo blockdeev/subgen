@@ -183,12 +183,14 @@ def process_video(
             if mode == "video":
                 dl_result, audio_path = download_video_full(
                     url, job_id, work_dir, on_progress, cookies_file=settings.ytdlp_cookies_file or None,
+                    proxy=settings.ytdlp_proxy or None,
                 )
                 video_path = dl_result.path
                 title, duration = dl_result.title, dl_result.duration
             else:
                 dl_result = download_audio_only(
                     url, job_id, work_dir, on_progress, cookies_file=settings.ytdlp_cookies_file or None,
+                    proxy=settings.ytdlp_proxy or None,
                 )
                 audio_path, title, duration = dl_result.path, dl_result.title, dl_result.duration
 

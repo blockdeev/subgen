@@ -532,6 +532,110 @@ curl -sI https://tu-dominio.com          # sin errores de certificado
 curl -sI https://files.tu-dominio.com    # idem -- un 400 de MinIO acá es normal, no diste un path de objeto
 ```
 
+### 9-bis. Proxy de salida (Cloudflare WARP) -- opcional pero muy recomendado
+
+**El problema que resuelve.** Las IPs de datacenter están mal vistas por
+las plataformas de video. Verificado en producción, con el MISMO video
+andando perfecto desde una IP residencial y fallando desde la VPS:
+
+- **YouTube**: "Sign in to confirm you're not a bot" recurrente. Obliga a
+  re-exportar cookies del navegador cada pocas horas -- inviable si la app
+  tiene que quedar andando sola.
+- **Odysee**: su CDN (CDN77) devuelve `429 Too Many Requests` con solo 2
+  pedidos por video. Es reputación de rango, no volumen: la API de LBRY
+  responde `200` sin problema, solo el CDN corta. No lo resuelven
+  `--force-ipv4`, ni user-agent de navegador, ni backoff.
+
+**El resultado con WARP** (medido, no proyectado): YouTube descarga
+completo **sin ninguna cookie** desde la VPS, y CDN77 pasa de `429` a
+`401` (o sea, deja de bloquear por reputación; el 401 era por un token de
+streaming vencido en la URL de prueba).
+
+WARP es gratis. Contrapartidas honestas: las IPs de salida son
+compartidas por mucha gente y rotan seguido, así que no hay garantía de
+que siga funcionando indefinidamente -- pero cuesta $0 y se prueba en un
+rato.
+
+**Instalación** (en cada VPS de worker):
+
+```bash
+curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+sudo apt update && sudo apt install -y cloudflare-warp socat
+```
+
+**Modo proxy, no VPN completa** -- esto importa: en modo VPN, TODO el
+tráfico de la VPS sale por el túnel, incluido el de Redis/MinIO por la red
+privada, y te podés quedar sin SSH. En modo proxy solo sale por el túnel
+lo que apunte explícitamente al puerto del proxy.
+
+```bash
+warp-cli registration new     # acepta los términos con "y"
+warp-cli mode proxy
+warp-cli connect
+warp-cli status               # tiene que decir Connected / Network: healthy
+```
+
+Verificá que el túnel realmente cambia la IP de salida:
+
+```bash
+curl -x socks5://127.0.0.1:40000 -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "^ip|^warp"
+curl -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "^ip|^warp"
+```
+
+La primera tiene que devolver `warp=on` y una IP distinta a la de la VPS.
+
+**El relay** -- WARP escucha solo en `127.0.0.1` del host, y los
+contenedores no llegan ahí. Confirmá primero cuál es la gateway REAL de la
+red de Docker (suele ser `172.18.0.1`, la que crea Compose, **no**
+`172.17.0.1` que es el bridge default y es la que uno asume por costumbre):
+
+```bash
+docker network inspect subgen_default -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+```
+
+Instalá el relay como servicio (hay un unit listo en
+`deploy/subgen-warp-relay.service` -- **ajustá la IP ahí si tu gateway es
+otra**). Levantarlo a mano con `socat ... &` funciona para probar, pero
+muere al cerrar la sesión SSH y deja las descargas rotas sin aviso:
+
+```bash
+sudo cp deploy/subgen-warp-relay.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now subgen-warp-relay
+sudo systemctl status subgen-warp-relay
+```
+
+**El firewall lo bloquea si no le abrís paso.** La conexión del contenedor
+hacia la gateway cuenta como entrante para `ufw`, y sin esta regla el
+síntoma es un timeout silencioso que parece un problema del proxy:
+
+```bash
+ufw allow from 172.18.0.0/16 to any port 40001 proto tcp
+```
+
+**Conectarlo a la app** -- en el `.env` del worker:
+
+```
+SUBGEN_YTDLP_PROXY=socks5h://172.18.0.1:40001
+```
+
+`socks5h`, no `socks5`: la "h" hace que el DNS lo resuelva el proxy del
+otro lado del túnel.
+
+```bash
+docker compose -f docker-compose.prod.yml up -d worker-1
+```
+
+**Verificación de punta a punta** -- una descarga real de YouTube sin
+cookies, que es exactamente lo que antes fallaba:
+
+```bash
+docker exec subgen-worker-1-1 yt-dlp --proxy socks5h://172.18.0.1:40001 \
+  --remote-components ejs:github -f bestaudio -o "/tmp/test.%(ext)s" \
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
 ### 10. Orden de arranque
 
 ```bash

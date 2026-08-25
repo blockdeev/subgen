@@ -85,6 +85,41 @@ class TestClassifyDownloadErrors:
         assert issubclass(TransientDownloadError, TransientPipelineError)
 
 
+# ── _maybe_add_proxy: proxy de salida (Cloudflare WARP) ──────────────────
+
+class TestMaybeAddProxy:
+    """Ver `ytdlp_proxy` en config.py: existe porque las IPs de datacenter
+    están mal vistas por las plataformas (YouTube pide cookies constantemente,
+    el CDN de Odysee tira 429 por reputación de rango)."""
+
+    def test_none_leaves_opts_unchanged(self):
+        from app.pipeline.download import _maybe_add_proxy
+
+        opts = _maybe_add_proxy({"format": "best"}, None)
+        assert "proxy" not in opts
+
+    def test_empty_string_leaves_opts_unchanged(self):
+        # No es lo mismo que pasar "": yt-dlp interpreta la cadena vacía
+        # como "ignorar cualquier proxy del entorno", que no es lo que
+        # queremos cuando la variable simplemente no está configurada.
+        from app.pipeline.download import _maybe_add_proxy
+
+        opts = _maybe_add_proxy({"format": "best"}, "")
+        assert "proxy" not in opts
+
+    def test_proxy_is_passed_through(self):
+        from app.pipeline.download import _maybe_add_proxy
+
+        opts = _maybe_add_proxy({"format": "best"}, "socks5h://172.18.0.1:40001")
+        assert opts["proxy"] == "socks5h://172.18.0.1:40001"
+
+    def test_does_not_clobber_other_opts(self):
+        from app.pipeline.download import _maybe_add_proxy
+
+        opts = _maybe_add_proxy({"format": "best", "quiet": True}, "socks5h://1.2.3.4:9000")
+        assert opts["format"] == "best" and opts["quiet"] is True
+
+
 # ── _maybe_add_cookies: soporte de cookies.txt para YouTube ──────────────
 
 class TestMaybeAddCookies:
