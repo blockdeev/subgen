@@ -81,8 +81,12 @@ class WorkerSettings(BaseSettings):
     # volumen real de pedidos. Verificado en producción: el MISMO video
     # que falla desde la VPS anda perfecto desde una IP residencial.
     #
-    # Con Cloudflare WARP como salida, YouTube descarga sin cookies
-    # (confirmado en vivo) y CDN77 deja de tirar 429. Ver DEPLOYMENT.md,
+    # Con Cloudflare WARP como salida, CDN77 deja de bloquear por
+    # reputación (medido con curl directo al CDN: pasa de 429 a 401).
+    #
+    # NO resuelve YouTube: se probó y un video normal falla igual que sin
+    # proxy ("Sign in to confirm you're not a bot"). Para YouTube siguen
+    # haciendo falta cookies frescas. Ver DEPLOYMENT.md,
     # sección "Proxy de salida (Cloudflare WARP)".
     #
     # Formato: "socks5h://IP:PUERTO" (socks5h = el proxy resuelve el DNS).

@@ -532,11 +532,12 @@ curl -sI https://tu-dominio.com          # sin errores de certificado
 curl -sI https://files.tu-dominio.com    # idem -- un 400 de MinIO acá es normal, no diste un path de objeto
 ```
 
-### 9-bis. Proxy de salida (Cloudflare WARP) -- opcional pero muy recomendado
+### 9-bis. Proxy de salida (Cloudflare WARP) -- resultados mixtos, leer antes de usar
 
-**El problema que resuelve.** Las IPs de datacenter están mal vistas por
-las plataformas de video. Verificado en producción, con el MISMO video
-andando perfecto desde una IP residencial y fallando desde la VPS:
+**El problema que se intentó resolver.** Las IPs de datacenter están mal
+vistas por las plataformas de video. Verificado en producción, con el
+MISMO video andando perfecto desde una IP residencial y fallando desde la
+VPS:
 
 - **YouTube**: "Sign in to confirm you're not a bot" recurrente. Obliga a
   re-exportar cookies del navegador cada pocas horas -- inviable si la app
@@ -546,15 +547,35 @@ andando perfecto desde una IP residencial y fallando desde la VPS:
   responde `200` sin problema, solo el CDN corta. No lo resuelven
   `--force-ipv4`, ni user-agent de navegador, ni backoff.
 
-**El resultado con WARP** (medido, no proyectado): YouTube descarga
-completo **sin ninguna cookie** desde la VPS, y CDN77 pasa de `429` a
-`401` (o sea, deja de bloquear por reputación; el 401 era por un token de
-streaming vencido en la URL de prueba).
+**Qué logra WARP realmente:**
 
-WARP es gratis. Contrapartidas honestas: las IPs de salida son
-compartidas por mucha gente y rotan seguido, así que no hay garantía de
-que siga funcionando indefinidamente -- pero cuesta $0 y se prueba en un
-rato.
+- **YouTube: NO lo resuelve.** Un video normal falla igual con WARP que
+  sin WARP. *Advertencia metodológica, por si alguien repite la prueba*:
+  el video `dQw4w9WgXcQ` (el clásico de Rick Astley, el que todo el mundo
+  usa para probar) **sí** funciona con WARP y sin cookies -- pero ese
+  video es excepcionalmente permisivo y pasa hasta con credenciales
+  vencidas. Probar con él da un falso positivo. Usá siempre un video
+  cualquiera, no ese.
+- **Odysee/CDN77: sí lo destraba.** Medido con `curl` directo al CDN desde
+  la VPS: sin proxy da `429`, con WARP da `401` (el 401 era por un token
+  de streaming vencido en la URL de prueba -- lo relevante es que dejó de
+  bloquear por reputación). **Pero** con `yt-dlp` desde el contenedor
+  sigue fallando antes, en `api.lbry.tv`, con `Host unreachable` -- una
+  anomalía sin explicar: `curl` al mismo destino por el mismo túnel desde
+  el host da `200`, y YouTube desde el contenedor por el mismo relay
+  funciona.
+
+**Recomendación**: dejar `SUBGEN_YTDLP_PROXY` vacío salvo que tengas un
+motivo concreto. Como está hoy, el proxy agrega una pieza más que se puede
+romper (si el relay se cae, TODAS las descargas fallan) sin resolver el
+problema principal. El código de soporte queda porque el día que
+consigas una salida con mejor reputación -- un proxy pago, otra VPS, otro
+proveedor -- es una sola variable de entorno.
+
+WARP es gratis. Contrapartidas: las IPs de salida son compartidas y
+**rotan solas** (verificado: cambió de `2a09:bac5:31c8:...` a
+`2a09:bac5:31cb:...` en el medio de las pruebas), así que ni siquiera la
+IP que probaste es la que vas a tener después.
 
 **Instalación** (en cada VPS de worker):
 
@@ -627,14 +648,32 @@ otro lado del túnel.
 docker compose -f docker-compose.prod.yml up -d worker-1
 ```
 
-**Verificación de punta a punta** -- una descarga real de YouTube sin
-cookies, que es exactamente lo que antes fallaba:
+**Verificación de punta a punta.** Confirmá que el tráfico sale por WARP
+y que el relay está arriba:
+
+```bash
+# la IP tiene que ser distinta a la de la VPS, y warp=on
+curl -x socks5://127.0.0.1:40000 -s https://www.cloudflare.com/cdn-cgi/trace | grep -E "^ip|^warp"
+
+# el relay tiene que estar active (running), no failed
+systemctl status subgen-warp-relay --no-pager | head -5
+```
+
+Si querés medir si el proxy sirve para alguna plataforma en particular,
+probá con **un video cualquiera** de esa plataforma -- nunca con
+`dQw4w9WgXcQ`, que da falso positivo (ver la advertencia metodológica
+arriba):
 
 ```bash
 docker exec subgen-worker-1-1 yt-dlp --proxy socks5h://172.18.0.1:40001 \
-  --remote-components ejs:github -f bestaudio -o "/tmp/test.%(ext)s" \
-  "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  --remote-components ejs:github --list-formats "URL_DE_UN_VIDEO_CUALQUIERA"
 ```
+
+**Si el relay se cae, TODAS las descargas fallan** -- y el error que
+aparece en los logs es el de la plataforma (por ejemplo, el "Sign in to
+confirm" de YouTube), no un error de proxy, así que es fácil
+diagnosticarlo mal. Ante cualquier fallo masivo de descargas, chequeá el
+relay primero.
 
 ### 10. Orden de arranque
 
