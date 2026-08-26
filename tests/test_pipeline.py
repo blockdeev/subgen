@@ -394,6 +394,70 @@ class TestTranslate:
         assert result[0].text == "item traducido", "el ítem debería reintentarse en el fallback, no quedar en inglés"
         assert fake_translator.translate.call_count == 3
 
+    def test_rescue_pass_recovers_segments_left_in_original_language(self, monkeypatch):
+        """El síntoma real reportado: en videos largos quedaban 2-3 lineas
+        sueltas en ingles, y en un video muy corto quedaba TODO en ingles
+        (pocos lotes = un solo fallo se lleva todo). La pasada de rescate
+        les da una segunda oportunidad, secuencial y sin apuro."""
+        import app.pipeline.translate as translate_module
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        # El lote falla siempre -> fallback item por item, que tambien falla
+        # -> los segmentos quedan con el texto original (el sintoma).
+        fake_translator.translate_batch.side_effect = Exception("429 Too Many Requests")
+        fake_translator.translate.side_effect = Exception("429 Too Many Requests")
+
+        # En la pasada de rescate, el traductor ya no falla.
+        rescue_translator = MagicMock()
+        rescue_translator.translate.return_value = "texto rescatado"
+
+        calls = {"n": 0}
+
+        def translator_factory(*args, **kwargs):
+            # Las primeras instancias son de la pasada principal; una vez
+            # que empieza el rescate se devuelve el que funciona.
+            calls["n"] += 1
+            return fake_translator if calls["n"] <= 2 else rescue_translator
+
+        with patch("deep_translator.GoogleTranslator", side_effect=translator_factory):
+            result = translate([Segment(start=0, end=1, text="hello")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "texto rescatado"
+        assert result[0].text_original == "hello"
+
+    def test_rescue_pass_skips_when_everything_already_translated(self, monkeypatch):
+        import app.pipeline.translate as translate_module
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.return_value = ["hola"]
+
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hello")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "hola"
+        # Nada pendiente -> el rescate no debe llamar a translate() ni una vez
+        assert fake_translator.translate.call_count == 0
+
+    def test_rescue_pass_gives_up_gracefully_and_keeps_original(self, monkeypatch):
+        # Si el rescate tampoco puede, se conserva el original: mejor una
+        # linea en el idioma de origen que un subtitulo vacio.
+        import app.pipeline.translate as translate_module
+
+        monkeypatch.setattr(translate_module.time, "sleep", lambda s: None)
+
+        fake_translator = MagicMock()
+        fake_translator.translate_batch.side_effect = Exception("429 Too Many Requests")
+        fake_translator.translate.side_effect = Exception("429 Too Many Requests")
+
+        with patch("deep_translator.GoogleTranslator", return_value=fake_translator):
+            result = translate([Segment(start=0, end=1, text="hello")], target_lang="es", batch_size=25)
+
+        assert result[0].text == "hello"
+
     def test_item_level_fallback_preserves_original_after_exhausting_retries(self, monkeypatch):
         import app.pipeline.translate as translate_module
         from deep_translator.exceptions import TranslationNotFound

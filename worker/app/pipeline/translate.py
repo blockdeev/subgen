@@ -36,6 +36,18 @@ _RATE_LIMIT_MARKERS = ("429", "too many requests", "quota", "rate limit", "rate-
 _MAX_BATCH_RETRIES = 3
 _BACKOFF_CAP_SECONDS = 8.0
 
+# Pasada de rescate: segunda oportunidad para los segmentos que quedaron
+# sin traducir después de la pasada principal. Deliberadamente lenta y
+# secuencial -- justo lo contrario de la pasada principal. La causa de que
+# fallen es el throttling de Google desde IP de datacenter, así que
+# insistir rápido y en paralelo sería contraproducente.
+#
+# Normalmente son 2-3 segmentos de cientos, o sea unos segundos. En el peor
+# caso (video corto donde falló todo) rehace todo, pero es corto por
+# definición.
+_RESCUE_MAX_ATTEMPTS = 4
+_RESCUE_SLEEP_SECONDS = 1.5
+
 
 @dataclass(frozen=True)
 class TranslatedSegment:
@@ -117,6 +129,72 @@ def _translate_one_with_retry(translator: Any, text: str) -> str:
     return text  # inalcanzable, el for siempre retorna arriba -- para el type checker
 
 
+def _rescue_untranslated(
+    target_lang: str,
+    translated: list[TranslatedSegment],
+) -> list[TranslatedSegment]:
+    """Segunda pasada sobre los segmentos que quedaron sin traducir.
+
+    Un segmento cuyo `text` quedó idéntico a `text_original` casi siempre
+    significa que agotó los reintentos y cayó al fallback que conserva el
+    original -- es lo que produce esas líneas sueltas en inglés en medio de
+    subtítulos en español.
+
+    También puede pasar que la traducción sea legítimamente igual al
+    original (nombres propios, números, "OK"). Reintentarlos no hace daño:
+    devuelven lo mismo y el resultado no cambia.
+
+    Secuencial y con pausas a propósito: si la pasada principal falló por
+    throttling, insistir en paralelo solo empeoraría las cosas.
+    """
+    pending = [
+        i for i, t in enumerate(translated)
+        if t.text == t.text_original and t.text.strip()
+    ]
+    if not pending:
+        return translated
+
+    logger.info(
+        "Pasada de rescate: %d de %d segmentos quedaron sin traducir",
+        len(pending), len(translated),
+    )
+
+    from deep_translator import GoogleTranslator
+
+    out = list(translated)
+    rescued = 0
+
+    for i in pending:
+        seg = out[i]
+        for attempt in range(_RESCUE_MAX_ATTEMPTS):
+            try:
+                # Traductor nuevo por ítem: la librería no es thread-safe y
+                # además una instancia "quemada" por throttling puede
+                # arrastrar estado. Instanciar es barato.
+                txt = GoogleTranslator(source="en", target=target_lang).translate(seg.text_original)
+                if txt and txt != seg.text_original:
+                    out[i] = TranslatedSegment(
+                        start=seg.start, end=seg.end,
+                        text_original=seg.text_original, text=str(txt),
+                    )
+                    rescued += 1
+                break  # traducido, o devolvió lo mismo (caso legítimo): no insistir
+            except Exception:  # noqa: BLE001 - la lib externa tira de todo
+                if attempt < _RESCUE_MAX_ATTEMPTS - 1:
+                    time.sleep(_RESCUE_SLEEP_SECONDS * (attempt + 1))
+
+    still_pending = len(pending) - rescued
+    if still_pending:
+        logger.warning(
+            "Pasada de rescate: %d recuperados, %d siguen en el idioma original",
+            rescued, still_pending,
+        )
+    else:
+        logger.info("Pasada de rescate: los %d segmentos se recuperaron", rescued)
+
+    return out
+
+
 def translate(
     segments: list[Segment],
     *,
@@ -183,6 +261,8 @@ def translate(
                     text_original=seg.text, text=(txt or seg.text),
                 )
             )
+
+    out = _rescue_untranslated(target_lang, out)
 
     on_progress(StageProgress(stage="translating", stage_pct=100.0, message_key="status.translating_done"))
     return out
